@@ -4,7 +4,8 @@ orchestrator fans out into parallel chains, and the fan-out is checked before an
   python egm_plan.py import   <design.md> plan.json [--as-decisions]   the design's goals, journeys, files and checks
   python egm_plan.py check    plan.json                                 is the fan-out sound? (sign_plan.py runs it too)
   python egm_plan.py render   plan.json fanout.md                       the fan-out as a document, for the Goldfish review
-  python egm_plan.py boundary plan.json <slug>                          what a chain changed outside its files
+  python egm_plan.py boundary plan.json <slug>                          what a chain changed outside its files (against
+                                                                        the branch below it when it is stacked)
 
 Every command takes --repo DIR and --base BRANCH (default: REPO and BASE from loop.json beside this script).
 
@@ -385,9 +386,15 @@ def cmd_boundary(a, c):
     if not b:
         raise SystemExit(f"no branch {a.slug} in {a.plan}")
     wt = a.worktree or os.path.join(c.get("WT_ROOT", ""), a.slug)
-    code, out = git(wt, "diff", "--name-only", f"origin/{a.base}...HEAD")
+    base = a.base
+    if not a.base_given:   # a stacked branch's own changes: against the branch below it (.fixloop/base)
+        try:
+            base = open(os.path.join(wt, ".fixloop", "base"), encoding="utf8").read().strip() or base
+        except OSError:
+            pass
+    code, out = git(wt, "diff", "--name-only", f"origin/{base}...HEAD")
     if code != 0:
-        raise SystemExit(f"can't diff {wt} against origin/{a.base}")
+        raise SystemExit(f"can't diff {wt} against origin/{base}")
     changed = [p for p in out.decode("utf8").splitlines() if p and not p.startswith(".fixloop/")]
     inside = [p for p in changed if any(p == f or fnmatch.fnmatch(p, f) for f in b.get("files", []))]
     rest = [p for p in changed if p not in inside]
@@ -414,6 +421,7 @@ def main(argv):
     p = sub.add_parser("render"); p.add_argument("plan"); p.add_argument("out")
     p = sub.add_parser("boundary"); p.add_argument("plan"); p.add_argument("slug"); p.add_argument("--worktree")
     a = ap.parse_args(argv)
+    a.base_given = any(x == "--base" or x.startswith("--base=") for x in (argv or []))
     {"import": cmd_import, "check": cmd_check, "render": cmd_render, "boundary": cmd_boundary}[a.cmd](a, c)
 
 

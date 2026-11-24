@@ -33,15 +33,22 @@ platform_notify() {
 
 # Keep the computer from sleeping for as long as process <pid> runs; the hold ends with it. macOS: caffeinate (idle
 # sleep always, system sleep too on mains power). Linux: systemd-inhibit, where systemd has it. Windows: keep_awake.ps1
-# (SetThreadExecutionState). A closed laptop lid still sleeps the computer. Never fails, never waits.
+# (SetThreadExecutionState), waiting on the process's Windows pid; with none readable it holds nothing and says so, on
+# stderr and in a toast (waiting on Git Bash's own pid would let go at once). A closed laptop lid still sleeps the
+# computer. Never fails, never waits.
 keep_awake() {  # <pid> [why]
     local pid="$1" why="${2:-a LaneLoop run is working}" wpid
     [ "${LANELOOP_KEEP_AWAKE:-${METALOOP_KEEP_AWAKE:-1}}" = 0 ] && return 0
     case "$PLATFORM" in
         mac) caffeinate -is -w "$pid" >/dev/null 2>&1 & ;;
-        windows) wpid=$(cat "/proc/$pid/winpid" 2>/dev/null) || return 0
-                 powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass \
-                     -File "$(cygpath -w "$PLATFORM_HERE/keep_awake.ps1")" "$wpid" >/dev/null 2>&1 & ;;
+        windows) wpid=$(cat "/proc/$pid/winpid" 2>/dev/null)
+                 if [ -z "$wpid" ]; then
+                     echo "keep_awake: no Windows pid for process $pid (/proc/$pid/winpid): this PC is NOT kept awake" >&2
+                     platform_notify "PC not kept awake" "No Windows pid for process $pid: set Sleep to Never for this run"
+                 else
+                     powershell.exe -NoProfile -WindowStyle Hidden -ExecutionPolicy Bypass \
+                         -File "$(cygpath -w "$PLATFORM_HERE/keep_awake.ps1")" "$wpid" >/dev/null 2>&1 &
+                 fi ;;
         *) if can_inhibit; then
                systemd-inhibit --what=idle:sleep --who=LaneLoop --why="$why" --mode=block \
                    sh -c 'while kill -0 "$1" 2>/dev/null; do sleep 20; done' sh "$pid" >/dev/null 2>&1 &

@@ -6,7 +6,7 @@
       "Edit(./**)", "Write(./**)",
       "Bash({{PYTHON}} {{RUN}}/task.py *)", "Bash({{PYTHON}} {{RUN}}/gate.py*)",
       "Bash(git status*)", "Bash(git diff*)", "Bash(git log*)", "Bash(git show*)", "Bash(git add *)",
-      "Bash(git commit *)", "Bash(git fetch*)", "Bash(git merge origin/{{BASE}}*)", "Bash(git rev-parse*)",
+      "Bash(git commit *)", "Bash(git fetch*)", "Bash(git merge origin/{{BASE}}*)", "Bash(git merge origin/{{BRANCH_PREFIX}}{{SLUG_PREFIX}}*)", "Bash(git rev-parse*)",
       "Bash(git branch --show-current)", "Bash(git restore *)", "Bash(git rm *)", "Bash(git mv *)",
       "Bash(git push -u origin {{BRANCH_PREFIX}}{{SLUG_PREFIX}}*)", "Bash(git push origin {{BRANCH_PREFIX}}{{SLUG_PREFIX}}*)",
       "Bash(gh pr create *)", "Bash(gh pr view *)", "Bash(gh pr checks *)", "Bash(gh pr diff *)",

@@ -52,6 +52,7 @@ cat > "$STUBS/st-run" <<'EOF'
 echo "st-run $* | LC_ALL=${LC_ALL:-} | SVC=${SVC_URL:-}" >> "$SELFTEST_LOG"
 case "$1" in
   build) if [ -n "${SELFTEST_BUILD_FAIL:-}" ]; then echo "error: missing toolchain component xyz"; exit 1; fi
+         [ -z "${SELFTEST_SLOW_SECS:-}" ] || sleep "$SELFTEST_SLOW_SECS"
          echo "built" ;;
   test)  if [ -n "${SVC_URL:-}" ]; then echo "svc=$(curl -s "$SVC_URL/ping.txt")" >> "$SELFTEST_LOG"; fi
          if [ "$2" = unit ] && [ -n "${SELFTEST_ZERO:-}" ]; then echo "Tests:       0 total"; exit 0; fi
@@ -90,7 +91,13 @@ fi
 [ -n "$REAL_GH" ] && exec "$REAL_GH" "\$@"
 echo "gh: command not found" >&2; exit 127
 EOF
-chmod +x "$STUBS/claude" "$STUBS/st-run" "$STUBS/gh"
+# awake_for <pid>: how many no-sleep assertions pmset reports held on behalf of process <pid>, in either form macOS prints
+# the owner ("on behalf of Process ID N", "on behalf of 'name' (pid N)")
+cat > "$STUBS/awake_for" <<'EOF'
+#!/usr/bin/env bash
+pmset -g assertions 2>/dev/null | grep -cE "on behalf of ('[^']*' \(pid $1\)|Process ID $1\$)"
+EOF
+chmod +x "$STUBS/claude" "$STUBS/st-run" "$STUBS/gh" "$STUBS/awake_for"
 ln -s "${SELFTEST_BASH:-$(command -v bash)}" "$STUBS/bash"
 export PATH="$STUBS:$PATH" SELFTEST_LOG="$T/steps.log"
 
@@ -228,6 +235,137 @@ tp done T1 "RetryBillsCurrentCustomer passes" >/dev/null
 check "done ticks a task" "$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); assert d['tasks_done']==['T1'], d" "$tw/.fixloop/status.json"
 check "done without a task id prints the usage, not a Python error" \
     sh -c "out=\$(cd '$tw' && '$PY' '$T/fix/task.py' done 2>&1); [ \$? -ne 0 ] && ! echo \"\$out\" | grep -q Traceback"
+echo "== task.py pr: a pull request is recorded only once it sits on the branch's base in the stack"
+TB="$("$PY" -c "import json,sys; print(json.load(open(sys.argv[1]))['BASE'])" "$T/fix/loop.json")"
+sw="$T/stk"; git init -q -b ai-work/s "$sw"; mkdir -p "$sw/.fixloop" "$T/tpbin"; echo ai-work/below > "$sw/.fixloop/base"
+fresh() { echo '{"slug":"s","status":"in_progress","phase":"pr","pr":null,"notes":[],"reviews":[],"summary":""}' > "$sw/.fixloop/status.json"; }
+fresh
+cat > "$T/tpbin/gh" <<'EOF'
+#!/usr/bin/env bash
+# gh pr view <N>: "<base> <head>" ($SELFTEST_TP_ON, exits 1 when it's empty; head $SELFTEST_TP_HEAD, default ai-work/s);
+# gh pr view <branch below>: "number state" of its PR ($SELFTEST_TP_PARENT, default "40 OPEN"); gh pr edit fails when
+# $SELFTEST_TP_EDIT_FAIL is set. gh api GET .../stacks?pull_request=N: $SELFTEST_TP_DIR/stack_N, else [] (a 404 when
+# $SELFTEST_TP_NO_STACKS is set); gh api -X POST: logs the body, fails when $SELFTEST_TP_STACK_FAIL is set.
+# A call starting with $SELFTEST_TP_FLAKY fails with an HTTP 502 while $SELFTEST_TP_DIR/flaky counts down to 0
+echo "gh $*" >> "$SELFTEST_TP_LOG"
+all="$*"; left=$(cat "$SELFTEST_TP_DIR/flaky" 2>/dev/null || echo 0)
+if [ -n "${SELFTEST_TP_FLAKY:-}" ] && [ "${all#"$SELFTEST_TP_FLAKY"}" != "$all" ] && [ "$left" -gt 0 ]; then
+  echo $((left - 1)) > "$SELFTEST_TP_DIR/flaky"; echo "HTTP 502: Bad Gateway (https://api.github.com/graphql)" >&2; exit 1
+fi
+case "$1 $2" in
+  "pr view") case "$3" in
+               *[!0-9]*) [ -n "${SELFTEST_TP_PARENT-40 OPEN}" ] || { echo "no pull requests found for branch \"$3\"" >&2; exit 1; }
+                         echo "${SELFTEST_TP_PARENT-40 OPEN}" ;;
+               *) [ -n "${SELFTEST_TP_ON:-}" ] || { echo "no pull requests found" >&2; exit 1; }
+                  echo "$SELFTEST_TP_ON ${SELFTEST_TP_HEAD:-ai-work/s}" ;;
+             esac ;;
+  "pr edit") [ -z "${SELFTEST_TP_EDIT_FAIL:-}" ] || { echo "HTTP 403: Resource not accessible by integration" >&2; exit 1; } ;;
+  api*) if [ "$2" = -X ]; then
+          echo "POST $4 $(cat)" >> "$SELFTEST_TP_LOG"
+          [ -z "${SELFTEST_TP_STACK_FAIL:-}" ] || { echo "gh: Validation Failed (HTTP 422)" >&2; exit 1; }
+          echo '{"number":9}'
+        else
+          [ -z "${SELFTEST_TP_NO_STACKS:-}" ] || { echo "gh: Not Found (HTTP 404)" >&2; exit 1; }
+          cat "$SELFTEST_TP_DIR/stack_${2##*=}" 2>/dev/null || echo '[]'
+        fi ;;
+esac
+EOF
+chmod +x "$T/tpbin/gh"
+[ "$WIN" = 1 ] && printf '@"%s" "%s" %%*\r\n' "$(cygpath -w "$(command -v bash)")" "$(cygpath -w "$T/tpbin/gh")" > "$T/tpbin/gh.cmd"
+export SELFTEST_TP_LOG="$T/tp-gh.log" SELFTEST_TP_DIR="$T/tpstk"; mkdir -p "$SELFTEST_TP_DIR"
+tpr() { : > "$SELFTEST_TP_LOG"; (cd "$sw" && PATH="${TP_PATH:-$T/tpbin}:$PATH" GH_RETRY_SECS=0 "$PY" "$T/fix/task.py" pr "$@" > "$T/tpr.out" 2>&1); }
+recorded() { "$PY" -c "import json,sys; print((json.load(open(sys.argv[1]))['pr'] or {}).get('number'))" "$sw/.fixloop/status.json"; }
+SELFTEST_TP_ON="$TB" SELFTEST_TP_EDIT_FAIL=1 tpr 41 https://github.com/o/r/pull/41; rc=$?
+check "a PR on the wrong base whose retarget fails is refused (exit $rc): nothing recorded" sh -c "[ $rc != 0 ] && [ '$(recorded)' = None ]"
+check "... saying why ($(tail -1 "$T/tpr.out" | cut -c1-80))" grep -q "HTTP 403" "$T/tpr.out"
+SELFTEST_TP_ON= tpr 41 https://github.com/o/r/pull/41; rc=$?
+check "a PR gh can't read is refused (exit $rc): its base can't be checked" sh -c "[ $rc != 0 ] && [ '$(recorded)' = None ]"
+check "... and isn't asked again: not finding the PR isn't a passing outage ($(grep -c 'pr view 41' "$SELFTEST_TP_LOG") reads)" \
+    test "$(grep -c 'pr view 41' "$SELFTEST_TP_LOG")" = 1
+SELFTEST_TP_ON=ai-work/below SELFTEST_TP_HEAD=ai-work/someone-else tpr 41 https://github.com/o/r/pull/41; rc=$?
+check "a PR of another branch is refused (exit $rc), and never retargeted" \
+    sh -c "[ $rc != 0 ] && [ '$(recorded)' = None ] && grep -q 'ai-work/someone-else' '$T/tpr.out' && ! grep -q 'pr edit' '$SELFTEST_TP_LOG'"
+# with no branch checked out (a chain may run `git checkout <base>~0`), whose PR it is can't be checked: never retarget it
+git -C "$sw" -c user.name=t -c user.email=t@t commit -q --allow-empty -m x && git -C "$sw" checkout -q --detach
+SELFTEST_TP_ON="$TB" SELFTEST_TP_HEAD=ai-work/someone-else tpr 41 https://github.com/o/r/pull/41; rc=$?
+check "on a detached HEAD a PR is refused (exit $rc), and never retargeted: it may be another branch's" \
+    sh -c "[ $rc != 0 ] && [ '$(recorded)' = None ] && grep -qi 'detached' '$T/tpr.out' && ! grep -q 'pr edit' '$SELFTEST_TP_LOG'"
+git -C "$sw" checkout -q ai-work/s
+SELFTEST_TP_ON=ai-work/below SELFTEST_TP_NO_STACKS=1 tpr 41 https://github.com/o/r/pull/41
+check "a PR already on the branch's base is recorded, and not edited" \
+    sh -c "[ '$(recorded)' = 41 ] && grep -q 'pr view 41' '$SELFTEST_TP_LOG' && ! grep -q 'pr edit' '$SELFTEST_TP_LOG'"
+fresh; SELFTEST_TP_ON="$TB" SELFTEST_TP_NO_STACKS=1 tpr 42 https://github.com/o/r/pull/42
+check "a PR opened against another base is retargeted to the branch's base, then recorded" \
+    sh -c "grep -q 'pr edit 42 .*--base ai-work/below' '$SELFTEST_TP_LOG' && [ '$(recorded)' = 42 ]"
+check "... and a note says so" sh -c "(cd '$sw' && '$PY' '$T/fix/task.py' show) | grep -q 'PR #42 .*retargeted from $TB to ai-work/below'"
+mkdir -p "$T/tpshim" && "$PY" -c "import sys; sys.path.insert(0, sys.argv[1]); import agent_run; agent_run.make_shims(sys.argv[2], sys.argv[3])" \
+    "$T/fix" "$T/fix/settings.json" "$T/tpshim" >/dev/null 2>&1
+fresh; TP_PATH="$T/tpshim/shims:$T/tpbin" SELFTEST_TP_ON="$TB" SELFTEST_TP_NO_STACKS=1 tpr 42 https://github.com/o/r/pull/42; rc=$?
+check "under a session's guard-rail shims (which deny gh pr edit and gh api), task.py's own gh calls still go through (exit $rc)" \
+    sh -c "[ -f '$T/tpshim/shims/gh.deny' ] && [ $rc = 0 ] && grep -q 'pr edit 42' '$SELFTEST_TP_LOG' && [ '$(recorded)' = 42 ]"
+
+echo "== task.py pr: a stacked branch's pull request joins the PR below it in a GitHub stack"
+fresh; SELFTEST_TP_ON=ai-work/below tpr 41 https://github.com/o/r/pull/41
+check "the PR below in no stack: a new GitHub stack is made of the two ($(grep -m1 POST "$SELFTEST_TP_LOG" | cut -c1-80))" \
+    sh -c "grep -qE 'POST repos/o/r/stacks \{\"pull_requests\": ?\[40, ?41\]\}' '$SELFTEST_TP_LOG' && [ '$(recorded)' = 41 ]"
+check "... and the note names the stack" sh -c "(cd '$sw' && '$PY' '$T/fix/task.py' show) | grep -q 'PR #41 opened.*GitHub stack #9'"
+echo '[{"number":7,"pull_requests":[{"number":39},{"number":40}]}]' > "$SELFTEST_TP_DIR/stack_40"
+fresh; SELFTEST_TP_ON=ai-work/below tpr 43 https://github.com/o/r/pull/43
+check "the PR below on top of a stack: this PR is added to that stack" \
+    sh -c "grep -qE 'POST repos/o/r/stacks/7/add \{\"pull_requests\": ?\[43\]\}' '$SELFTEST_TP_LOG' && [ '$(recorded)' = 43 ]"
+echo '[{"number":7,"pull_requests":[{"number":39},{"number":40},{"number":44}]}]' > "$SELFTEST_TP_DIR/stack_44"
+fresh; SELFTEST_TP_ON=ai-work/below tpr 44 https://github.com/o/r/pull/44
+check "a PR already in a stack is recorded with no stack change" sh -c "! grep -q POST '$SELFTEST_TP_LOG' && [ '$(recorded)' = 44 ]"
+echo '[{"number":7,"pull_requests":[{"number":40},{"number":45}]}]' > "$SELFTEST_TP_DIR/stack_40"
+fresh; SELFTEST_TP_ON=ai-work/below tpr 46 https://github.com/o/r/pull/46; rc=$?
+check "a second PR on the same parent (a fork: stacks are linear) is recorded, not stacked (exit $rc)" \
+    sh -c "[ $rc = 0 ] && ! grep -q POST '$SELFTEST_TP_LOG' && [ '$(recorded)' = 46 ]"
+check "... and the note says it stays base-chained" sh -c "(cd '$sw' && '$PY' '$T/fix/task.py' show) | grep -q 'PR #46 opened.*base-chained'"
+rm -f "$SELFTEST_TP_DIR/stack_40"
+fresh; SELFTEST_TP_ON=ai-work/below SELFTEST_TP_STACK_FAIL=1 tpr 47 https://github.com/o/r/pull/47; rc=$?
+# stacking is extra: a refusal must never cost the PR its record, or the runner holds back every branch above it
+check "a stack GitHub refuses to make still records the PR, base-chained (exit $rc)" sh -c "[ $rc = 0 ] && [ '$(recorded)' = 47 ]"
+check "... and says why, on stderr and in the note" sh -c "grep -q 'HTTP 422' '$T/tpr.out' && (cd '$sw' && '$PY' '$T/fix/task.py' show) | grep -q 'PR #47 opened.*not in a GitHub stack.*HTTP 422'"
+fresh; SELFTEST_TP_ON=ai-work/below SELFTEST_TP_PARENT= tpr 50 https://github.com/o/r/pull/50; rc=$?
+check "a PR below that gh can't find still records this PR, unstacked, with a note (exit $rc)" \
+    sh -c "[ $rc = 0 ] && [ '$(recorded)' = 50 ] && (cd '$sw' && '$PY' '$T/fix/task.py' show) | grep -q 'PR #50 opened.*not in a GitHub stack'"
+fresh; SELFTEST_TP_ON=ai-work/below SELFTEST_TP_NO_STACKS=1 tpr 48 https://github.com/o/r/pull/48; rc=$?
+check "a repository without stacks (404) records the PR base-chained (exit $rc)" sh -c "[ $rc = 0 ] && [ '$(recorded)' = 48 ] && ! grep -q POST '$SELFTEST_TP_LOG'"
+check "... with a note" sh -c "(cd '$sw' && '$PY' '$T/fix/task.py' show) | grep -q 'PR #48 opened.*no GitHub stacks'"
+echo "$TB" > "$sw/.fixloop/base"
+fresh; SELFTEST_TP_ON="$TB" tpr 49 https://github.com/o/r/pull/49
+check "a PR on the base (the bottom of a stack) makes no stack call" sh -c "[ '$(recorded)' = 49 ] && ! grep -q 'gh api' '$SELFTEST_TP_LOG'"
+echo ai-work/below > "$sw/.fixloop/base"
+
+echo "== task.py pr: a passing GitHub outage (5xx, rate limit, timeout) on a read is retried before the PR is refused"
+echo 2 > "$SELFTEST_TP_DIR/flaky"
+fresh; SELFTEST_TP_FLAKY="pr view 50" SELFTEST_TP_ON=ai-work/below SELFTEST_TP_NO_STACKS=1 tpr 50 https://github.com/o/r/pull/50; rc=$?
+check "two 502s reading the PR's base, then an answer: recorded (exit $rc, $(grep -c 'pr view 50' "$SELFTEST_TP_LOG") reads)" \
+    sh -c "[ $rc = 0 ] && [ '$(recorded)' = 50 ] && [ \$(grep -c 'pr view 50' '$SELFTEST_TP_LOG') = 3 ]"
+echo 2 > "$SELFTEST_TP_DIR/flaky"
+fresh; SELFTEST_TP_FLAKY="api repos/o/r/stacks?pull_request=51" SELFTEST_TP_ON=ai-work/below tpr 51 https://github.com/o/r/pull/51; rc=$?
+check "two 502s reading the stacks, then an answer: stacked and recorded (exit $rc)" \
+    sh -c "[ $rc = 0 ] && [ '$(recorded)' = 51 ] && grep -qE 'POST repos/o/r/stacks \{\"pull_requests\": ?\[40, ?51\]\}' '$SELFTEST_TP_LOG'"
+echo 9 > "$SELFTEST_TP_DIR/flaky"
+fresh; SELFTEST_TP_FLAKY="pr view 52" SELFTEST_TP_ON=ai-work/below tpr 52 https://github.com/o/r/pull/52; rc=$?
+check "a read still failing after 3 tries is refused (exit $rc, $(grep -c 'pr view 52' "$SELFTEST_TP_LOG") reads): nothing recorded" \
+    sh -c "[ $rc != 0 ] && [ '$(recorded)' = None ] && [ \$(grep -c 'pr view 52' '$SELFTEST_TP_LOG') = 3 ] && grep -q 'HTTP 502' '$T/tpr.out'"
+echo 9 > "$SELFTEST_TP_DIR/flaky"
+fresh; SELFTEST_TP_FLAKY="api -X POST" SELFTEST_TP_ON=ai-work/below tpr 54 https://github.com/o/r/pull/54; rc=$?
+check "a write (making the stack) that hits a 502 isn't retried: the PR is recorded unstacked, with a note (exit $rc, $(grep -c '^POST' "$SELFTEST_TP_LOG") POSTs logged)" \
+    sh -c "[ $rc = 0 ] && [ '$(recorded)' = 54 ] && [ \$(grep -c 'api -X POST' '$SELFTEST_TP_LOG') = 1 ] && (cd '$sw' && '$PY' '$T/fix/task.py' show) | grep -q 'PR #54 opened.*not in a GitHub stack.*HTTP 502'"
+rm -f "$SELFTEST_TP_DIR/flaky"
+
+echo "== task.py pr: with no BASE in loop.json, the trunk is never taken for a branch below"
+cp "$T/fix/loop.json" "$T/loop.json.keep"
+"$PY" -c "import json,sys; d=json.load(open(sys.argv[1])); d.pop('BASE',None); json.dump(d,open(sys.argv[1],'w'))" "$T/fix/loop.json"
+echo main > "$sw/.fixloop/base"
+fresh; SELFTEST_TP_ON=main tpr 53 https://github.com/o/r/pull/53; rc=$?
+check "a PR on its branch's base, with no BASE set, is recorded with no stack call (exit $rc)" \
+    sh -c "[ $rc = 0 ] && [ '$(recorded)' = 53 ] && ! grep -qE 'gh api|pr view main' '$SELFTEST_TP_LOG'"
+check "... and the note says its GitHub stack wasn't checked" \
+    sh -c "(cd '$sw' && '$PY' '$T/fix/task.py' show) | grep -q \"PR #53 opened.*stack wasn't checked\""
+mv "$T/loop.json.keep" "$T/fix/loop.json"
 rw="$T/race"; mkdir -p "$rw/.fixloop"
 echo '{"slug":"r","status":"in_progress","phase":"green","pr":null,"notes":[],"reviews":[],"summary":""}' > "$rw/.fixloop/status.json"
 notes() { for i in $(seq 1 12); do (cd "$rw" && "$PY" "$T/fix/task.py" note "$1$i") >/dev/null 2>&1; done; }
@@ -246,6 +384,35 @@ plan_edit "p['branches'][1]['tasks'] = [{'id': 'T1', 'text': 'The panel says Not
 (cd "$T/fix" && "$PY" sign_plan.py plan-t.json 2026-11-07 Selftest >/dev/null && "$PY" make_briefs.py plan-t.json --wave 1 >/dev/null)
 check "a signed-off plan's briefs say so" grep -q "^Plan signed off: 2026-11-07 by Selftest" "$T/fix/briefs/retry-current-customer.md"
 check "... and list the branch's tasks with the test that proves each" grep -q "^- T1 · .* · proved by: " "$T/fix/briefs/retry-current-customer.md"
+# A branch that builds on another's code is stacked on it ("on"); every other branch is independent, on the base
+check "a branch with no \"on\" is independent: it sits on the base" grep -q "^Stacked on: -$" "$T/fix/briefs/retry-current-customer.md"
+(cd "$T/fix" && "$PY" make_briefs.py plan-t.json --wave 2 >/dev/null 2>&1)
+check "... the next one too: listing order alone stacks nothing" grep -q "^Stacked on: -$" "$T/fix/briefs/order-panel-not-syncing.md"
+plan_edit "p['branches'][1]['on'] = 'retry-current-customer'"
+(cd "$T/fix" && "$PY" make_briefs.py plan-t.json --wave 2 >/dev/null 2>&1)
+check "\"on\": \"<slug>\" stacks a branch on the one it builds on" grep -q "^Stacked on: retry-current-customer$" "$T/fix/briefs/order-panel-not-syncing.md"
+plan_edit "p['branches'][1]['on'] = 'no-such-branch'"
+check "make_briefs refuses a branch stacked on one the plan doesn't have" \
+    sh -c "cd '$T/fix' && ! '$PY' make_briefs.py plan-t.json --wave 2 >/dev/null 2>&1 && '$PY' make_briefs.py plan-t.json --wave 2 2>&1 | grep -q no-such-branch"
+plan_edit "p['branches'][0]['on'] = 'order-panel-not-syncing'; p['branches'][1]['on'] = 'retry-current-customer'"
+check "make_briefs refuses a stack that loops" sh -c "cd '$T/fix' && ! '$PY' make_briefs.py plan-t.json --wave 1 >/dev/null 2>&1"
+plan_edit "p['branches'][0].pop('on'); p['branches'][1]['on'] = None"
+(cd "$T/fix" && "$PY" make_briefs.py plan-t.json --wave 2 >/dev/null 2>&1)
+check "\"on\": null is independent too, on the base" grep -q "^Stacked on: -$" "$T/fix/briefs/order-panel-not-syncing.md"
+plan_edit "p['branches'][1].pop('on')"
+# 1 <- 2 <- 3 <- 4 build on each other; A and X build on nothing: one stack four deep, and two branches beside it
+"$PY" - "$T/fix/plan-stk.json" <<'EOF'
+import json, sys
+b = lambda slug, on=None: dict({"slug": slug, "wave": 1, "mode": "build", "scope": "s", "est_lines": 50,
+                                "tasks": [{"id": "T1", "text": "t", "test": "x"}]}, **({"on": on} if on else {}))
+json.dump({"signed_off": {"at": "2026-11-24", "by": "Selftest"},
+           "branches": [b("t1"), b("t2", "t1"), b("t3", "t2"), b("t4", "t3"), b("ind-a"), b("ind-x")]}, open(sys.argv[1], "w"))
+EOF
+(cd "$T/fix" && "$PY" make_briefs.py plan-stk.json --wave 1 --queue queue-mixed.txt >/dev/null 2>&1)
+stacked_on() { sed -n 's/^Stacked on: //p' "$T/fix/briefs/$1.md"; }
+check "a plan of 1 <- 2 <- 3 <- 4 plus A and X: one stack four deep ($(for x in t1 t2 t3 t4; do printf '%s:%s ' $x "$(stacked_on $x)"; done))" \
+    sh -c "[ '$(stacked_on t1)' = - ] && [ '$(stacked_on t2)' = t1 ] && [ '$(stacked_on t3)' = t2 ] && [ '$(stacked_on t4)' = t3 ]"
+check "... and A and X unstacked, on the base" sh -c "[ '$(stacked_on ind-a)' = - ] && [ '$(stacked_on ind-x)' = - ]"
 (cd "$T/fix" && "$PY" plan_page.py plan-t.json "$T/plan.html" "Selftest Plan" > "$T/plan_page.out" 2>&1)
 check "plan_page renders the plan into the page" sh -c "grep -q 'retry-current-customer' '$T/plan.html' && ! grep -qE '__PLAN__|__TWO_WAY__' '$T/plan.html'"
 check "plan_page prints the capabilities to publish it with" grep -q '"comments"' "$T/plan_page.out"
@@ -296,6 +463,11 @@ assert s.get('package-lock.json') == 'lockfile' and s.get(sys.argv[3] + '/panel.
 assert 'generated' in s.get('src/client_gen.py', '') and s.get('logo.png') == 'binary', s" "$T/fix" "$S/wt" "$MD"
 (cd "$S/wt" && lines 40 > src/scratch.py)
 check "... and work not committed yet, so a chain sees its size before it commits" test "$(sz | cut -d' ' -f1)" = 343
+# A stacked branch's PR shows only its own diff against the branch below it, so its size counts from there (.fixloop/base)
+(cd "$S/wt" && git push -q origin HEAD:ai-work/size-below 2>/dev/null)
+mkdir -p "$S/wt/.fixloop" && echo ai-work/size-below > "$S/wt/.fixloop/base"
+check "a stacked branch's size counts only what it adds to the branch below it (.fixloop/base)" test "$(sz | cut -d' ' -f1)" = 40
+rm -f "$S/wt/.fixloop/base"
 mkdir -p "$S/wt/.fixloop"
 printf '# Fix branch `size`\n\nPlan signed off: 2026-11-18 by Selftest\nSize cap: 400 changed lines, tests included (planned at about 300). See the runbook\n' > "$S/wt/.fixloop/brief.md"
 echo '{"slug":"size","status":"in_progress","phase":"green","pr":null,"notes":[],"reviews":[],"summary":""}' > "$S/wt/.fixloop/status.json"
@@ -498,6 +670,11 @@ check "boundary: a chain that kept to its files (and their tests) passes" sh -c 
 (cd "$E/repo" && echo x > src/webhooks/signing.py && git add -A && gitc commit -qm stray)
 check "boundary: a file another branch owns is flagged" \
     sh -c "(cd '$E/run' && '$PY' egm_plan.py boundary plan.json dispatch --worktree '$E/repo') 2>&1 | grep -A2 OUTSIDE | grep -q src/webhooks/signing.py"
+# stacked on the branch below it, a chain's boundary is what it changed on top of that branch (.fixloop/base)
+(cd "$E/repo" && git push -q origin HEAD:ai-work/below-dispatch 2>/dev/null && mkdir -p .fixloop && echo ai-work/below-dispatch > .fixloop/base)
+check "boundary: a stacked branch is checked only for what it adds to the branch below it" \
+    sh -c "cd '$E/run' && '$PY' egm_plan.py boundary plan.json dispatch --worktree '$E/repo'"
+rm -rf "$E/repo/.fixloop"
 (cd "$E/repo" && git checkout -q develop && echo "*   One more goal" >> docs/designs/webhooks.md && gitc commit -qam "design v2" && git push -q origin develop 2>/dev/null)
 check "check notices the design on the base moved since the import" \
     sh -c "(cd '$E/run' && '$PY' egm_plan.py check plan.json) 2>&1 | grep -q 'not the one this plan was imported from'"
@@ -515,12 +692,15 @@ EOF
 check "doctor: PLANNER=grill doesn't need it" "$PY" -c \
     "import json,sys; i=[x for x in json.load(open(sys.argv[1]))['items'] if x['name']=='EGM plugin'][0]; assert i['state']=='skipped', i" "$E/doctor-grill.json"
 
-echo "== runner: a queue of three chains, two at a time, under this bash"
+echo "== runner: a queue of three chains, two at a time, under this bash, keeping the computer awake"
 for s in alpha beta-error gamma; do printf '# Fix branch `%s`\n\nPlan signed off: 2026-11-07 by Selftest\n' "$s" > "$T/fix/briefs/$s.md"; done
+wtr0=$(sed -n 's/^WT_ROOT=//p' "$T/fix/loop.conf" | tr -d "'")
 cat > "$T/fix/fixloop.sh" <<'EOF'
 #!/usr/bin/env bash
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$ROOT/loop.conf"
 mkdir -p "$WT_ROOT/$1/.fixloop"; sleep 2
+# the runner (this chain's parent) keeps the computer awake while chains run: on macOS, caffeinate holds an assertion for it
+[ "$(uname -s)" = Darwin ] && echo "$PPID $(awake_for "$PPID")" >> "$WT_ROOT/awake.txt"
 echo '{"slug":"'"$1"'","status":"awaiting_owner","phase":"ci","pr":null,"notes":[],"reviews":[],"summary":"stub"}' > "$WT_ROOT/$1/.fixloop/status.json"
 EOF
 chmod +x "$T/fix/fixloop.sh"
@@ -531,6 +711,28 @@ for s in alpha beta-error gamma; do
     check "runner: $s started and ended awaiting_owner" grep -q "chain ended: $s (awaiting_owner)" "$T/fix/logs/runner.log"
 done
 check "runner: all chains ended" grep -q "all chains ended" "$T/fix/logs/runner.log"
+if [ "$(uname -s)" = Darwin ]; then
+    aw="$wtr0/awake.txt"; rp=$(head -1 "$aw" 2>/dev/null | cut -d' ' -f1)
+    check "runner: the Mac is kept awake while its chains run ($(tr '\n' ' ' < "$aw" 2>/dev/null))" \
+        sh -c "awk '\$2 < 1 {bad=1} END {exit bad || NR == 0}' '$aw'"
+    check "runner: ... and let go once they have all ended" wait_for 10 sh -c "[ -n '$rp' ] && [ \"\$(awake_for '$rp')\" = 0 ]"
+    # macOS releases print the assertion's owner as "Process ID N" or "'name' (pid N)": the same run again, with pmset
+    # printing each form as the other, so the checks hold whichever form this Mac prints
+    mkdir -p "$T/flip"; cat > "$T/flip/pmset" <<'EOF'
+#!/bin/sh
+/usr/bin/pmset "$@" | sed -E -e 's/on behalf of Process ID ([0-9]+)$/on behalf of @\1/' \
+    -e "s/on behalf of '[^']*' \(pid ([0-9]+)\)/on behalf of Process ID \1/" -e "s/on behalf of @([0-9]+)/on behalf of 'bash' (pid \1)/"
+EOF
+    chmod +x "$T/flip/pmset"; : > "$aw"
+    printf 'alpha\n' > "$T/fix/queue-flip.txt"
+    ( cd "$T/fix" && PATH="$T/flip:$PATH" QUEUE=queue-flip.txt STAGGER_SECS=0 POLL_SECS=1 ./runner.sh > "$T/runner-flip.out" 2>&1 ) &
+    r=$!; wait_for 30 sh -c "! kill -0 $r"; kill $r 2>/dev/null
+    rp=$(head -1 "$aw" 2>/dev/null | cut -d' ' -f1)
+    check "runner: kept awake with pmset's other form too ($(tr '\n' ' ' < "$aw"))" sh -c "awk '\$2 < 1 {bad=1} END {exit bad || NR == 0}' '$aw'"
+    check "runner: ... and let go" wait_for 10 sh -c "[ -n '$rp' ] && [ \"\$(PATH='$T/flip:$PATH' awake_for '$rp')\" = 0 ]"
+else
+    skip "runner keep-awake hold: macOS only here (systemd-inhibit on Linux, keep_awake.ps1 on Windows)"
+fi
 check "runner: a queue with no design branch checks only the code pin" sh -c "! grep -q 'plan pin' '$T/fix/logs/runner.log'"
 check "runner: makes the run's PR label on the repository" \
     grep -qF -- 'gh label create laneloop:fix --repo o/r --color 2563EB --force' "$T/steps.log.gh"
@@ -542,6 +744,9 @@ started = [i for i, l in enumerate(lines) if "chain started" in l]
 assert ready and started and ready[0] < started[0], lines
 EOF
 check "the runbook opens every pull request with that label" grep -qF -- '--label laneloop:fix --title' "$T/fix/runbook.md"
+check "... against the branch's own base in its stack, never the run's base" \
+    sh -c "grep -qF -- 'gh pr create --base <base> --label' '$T/fix/runbook.md' && ! grep -q 'gh pr create --base [^<]' '$T/fix/runbook.md'"
+check "a chain may merge the branch below it (its base in the stack)" grep -qF 'Bash(git merge origin/ai-work/*)' "$T/fix/settings.json"
 out=$(cd "$T/fix" && SELFTEST_GH_LABEL_FAIL=1 QUEUE=queue-test.txt STAGGER_SECS=0 POLL_SECS=1 ./runner.sh 2>&1)
 check "runner: a label it can't make STOPs the run, says why, and how to go on without one" \
     sh -c "echo \"\$1\" | grep -q \"STOP: could not create the PR label 'laneloop:fix' on o/r: HTTP 403.*PR_LABEL=\" && ! echo \"\$1\" | grep -q 'chain started'" _ "$out"
@@ -565,6 +770,55 @@ printf 'zeta\n' > "$T/fix/queue-unsigned.txt"
 out=$(cd "$T/fix" && QUEUE=queue-unsigned.txt STAGGER_SECS=0 POLL_SECS=1 ./runner.sh 2>&1)
 check "runner: refuses a branch whose brief has no signed-off plan" sh -c "echo \"\$1\" | grep -q 'STOP: zeta.*Plan signed off'" _ "$out"
 check "... and starts nothing" sh -c "! grep -q 'chain started: zeta' '$T/fix/logs/runner.log'"
+
+echo "== runner: a stacked branch starts once the branch below it has opened its pull request"
+cp "$T/fix/fixloop.sh" "$T/fix/fixloop.sh.flat"
+cat > "$T/fix/fixloop.sh" <<'EOS'
+#!/usr/bin/env bash
+ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"; source "$ROOT/loop.conf"
+mkdir -p "$WT_ROOT/$1/.fixloop"; sleep 2
+pr=null; case "$1" in *nopr*) ;; *) pr='{"number": 7, "url": "https://github.com/o/r/pull/7"}' ;; esac
+echo '{"slug":"'"$1"'","status":"awaiting_owner","phase":"ci","pr":'"$pr"',"notes":[],"reviews":[],"summary":"stub"}' > "$WT_ROOT/$1/.fixloop/status.json"
+EOS
+chmod +x "$T/fix/fixloop.sh"
+for s in stk-a:- stk-b:stk-a stk-nopr:- stk-c:stk-nopr; do
+    printf '# Fix branch `%s`\n\nPlan signed off: 2026-11-24 by Selftest\nStacked on: %s\n' "${s%%:*}" "${s#*:}" > "$T/fix/briefs/${s%%:*}.md"
+done
+# a design chain pushes its page and ends awaiting the owner with no PR: a design branch on it may start, a build one may not
+for s in dsg-nopr:- dsg-kid:dsg-nopr; do
+    printf '# Design branch `%s`\n\nMode: design. Deliver: mockup\nPlan signed off: 2026-11-24 by Selftest\nStacked on: %s\n' "${s%%:*}" "${s#*:}" > "$T/fix/briefs/${s%%:*}.md"
+done
+printf '# Fix branch `dsg-build`\n\nPlan signed off: 2026-11-24 by Selftest\nStacked on: dsg-nopr\n' > "$T/fix/briefs/dsg-build.md"
+printf 'stk-b\nstk-a\nstk-nopr\nstk-c\ndsg-kid\ndsg-build\ndsg-nopr\n' > "$T/fix/queue-stack.txt"   # children queued before their parents
+( cd "$T/fix" && QUEUE=queue-stack.txt MAX_PAR=4 STAGGER_SECS=0 POLL_SECS=1 ./runner.sh > "$T/runner-stack.out" 2>&1 ) &
+r=$!; wait_for 60 sh -c "! kill -0 $r"; kill $r 2>/dev/null
+check "runner: a stacked branch waits for the branch below it to open its pull request" \
+    sh -c "a=\$(grep -n 'chain ended: stk-a ' '$T/fix/logs/runner.log' | tail -1 | cut -d: -f1); b=\$(grep -n 'chain started: stk-b ' '$T/fix/logs/runner.log' | tail -1 | cut -d: -f1); [ -n \"\$a\" ] && [ -n \"\$b\" ] && [ \"\$b\" -gt \"\$a\" ]"
+check "runner: ... a branch stacked on one that ended without a pull request is never started, and the log says why" \
+    sh -c "grep -q 'not started: stk-c: stacked on stk-nopr, which ended without a pull request' '$T/fix/logs/runner.log' && ! grep -q 'chain started: stk-c ' '$T/fix/logs/runner.log'"
+check "runner: a design branch on a design branch starts once that one has pushed its page (ended awaiting the owner)" \
+    sh -c "a=\$(grep -n 'chain ended: dsg-nopr ' '$T/fix/logs/runner.log' | tail -1 | cut -d: -f1); b=\$(grep -n 'chain started: dsg-kid ' '$T/fix/logs/runner.log' | tail -1 | cut -d: -f1); [ -n \"\$a\" ] && [ -n \"\$b\" ] && [ \"\$b\" -gt \"\$a\" ]"
+check "runner: ... a build branch on it still waits for a pull request" \
+    sh -c "grep -q 'not started: dsg-build: stacked on dsg-nopr' '$T/fix/logs/runner.log' && ! grep -q 'chain started: dsg-build ' '$T/fix/logs/runner.log'"
+check "runner: ... and the runner still ends" sh -c "tail -1 '$T/fix/logs/runner.log' | grep -q 'all chains ended'"
+# independent branches run beside a stack: with MAX_PAR 3, the stack's bottom, A and X start together; 2 waits for 1's PR
+n0=$(wc -l < "$T/fix/logs/runner.log")
+( cd "$T/fix" && QUEUE=queue-mixed.txt MAX_PAR=3 STAGGER_SECS=0 POLL_SECS=1 ./runner.sh > "$T/runner-mixed.out" 2>&1 ) &
+r=$!; wait_for 90 sh -c "! kill -0 $r"; kill $r 2>/dev/null
+tail -n +"$((n0 + 1))" "$T/fix/logs/runner.log" > "$T/mixed.log"
+check "runner: the stack's bottom and the independent A and X start together, before any chain ends ($(grep -o 'chain started: [^ ]*' "$T/mixed.log" | head -3 | cut -d' ' -f3 | tr '\n' ' '))" \
+    "$PY" - "$T/mixed.log" <<'EOF'
+import sys
+lines = open(sys.argv[1]).read().splitlines()
+started = [l.split("chain started: ")[1].split()[0] for l in lines if "chain started: " in l]
+first_end = next(i for i, l in enumerate(lines) if "chain ended: " in l)
+early = [l.split("chain started: ")[1].split()[0] for l in lines[:first_end] if "chain started: " in l]
+assert sorted(early) == ["ind-a", "ind-x", "t1"], (early, started)
+EOF
+check "runner: ... 2 starts only once 1 has opened its PR, and the stack runs to the top" \
+    sh -c "a=\$(grep -n 'chain ended: t1 ' '$T/mixed.log' | cut -d: -f1); b=\$(grep -n 'chain started: t2 ' '$T/mixed.log' | cut -d: -f1); [ -n \"\$a\" ] && [ -n \"\$b\" ] && [ \"\$b\" -gt \"\$a\" ] && grep -q 'chain ended: t4 ' '$T/mixed.log'"
+grep -qiE "unbound|command not found|invalid option|syntax error" "$T/runner-stack.out" && bad "runner (stacks): shell errors: $(grep -iE 'unbound|not found|invalid|syntax' "$T/runner-stack.out" | head -2)"
+mv "$T/fix/fixloop.sh.flat" "$T/fix/fixloop.sh"
 
 echo "== the session page: one per orchestrator session, a tab per task, kept current from their state, never committed"
 lw="$wtr/lp"; mkdir -p "$lw/.fixloop/state"
@@ -747,6 +1001,13 @@ check "kill_tree stops it" wait_for 10 sh -c "! curl -s http://127.0.0.1:$p/ -o 
 check "sha1 prints a SHA-1" sh -c "echo x | bash -c \"source '$T/fix/platform.sh' && sha1\" | grep -qE '^[0-9a-f]{40}'"
 [ "$WIN" = 1 ] || check "cygpath stands in for Git Bash's on POSIX" \
     test "$(bash -c "source '$T/fix/platform.sh' && cygpath -m '$T/a b'")" = "$T/a b"
+# Windows keep-awake waits on the process's Windows pid (/proc/<pid>/winpid); Git Bash's own pid would let go at once
+mkdir -p "$T/ps"; printf '#!/usr/bin/env bash\necho "$*" >> "$SELFTEST_PS_LOG"\n' > "$T/ps/powershell.exe"; chmod +x "$T/ps/powershell.exe"
+err=$(PATH="$T/ps:$PATH" SELFTEST_PS_LOG="$T/ps.log" bash -c "source '$T/fix/platform.sh'; PLATFORM=windows; keep_awake 2147483646" 2>&1 >/dev/null)
+check "Windows keep-awake with no readable Windows pid says so on stderr ($(echo "$err" | head -1 | cut -c1-80))" \
+    sh -c "echo \"\$1\" | grep -qi 'not kept awake'" _ "$err"
+check "... and as a toast" wait_for 5 grep -q notify.ps1 "$T/ps.log"
+check "... and launches no keep_awake.ps1 that would let go at once" sh -c "! grep -q keep_awake.ps1 '$T/ps.log'"
 
 echo "== test-output parsers: every preset reads its runner's summary, failures and names"
 check "dotnet, pytest, jest, vitest, go, cargo, rspec, maven and phpunit output, passing, failing and empty" "$PY" - "$T/fix" <<'EOF'
@@ -854,6 +1115,19 @@ init fix "$T/fix" PROJECT="$T/nogate.json"
 out=$(gate_run)
 check "a profile with no gate steps fails the gate and says so" sh -c "echo \"\$1\" | grep -q '^gate FAIL' && echo \"\$1\" | grep -q 'no gate.steps'" _ "$out"
 init fix "$T/fix" PROJECT="$T/project.json"
+if [ "$(uname -s)" = Darwin ]; then
+    # A gate is often started straight from a session or merge_base.sh, not through launch.sh: it keeps the Mac awake
+    # itself, or an idle sleep stalls it mid-suite. A slow build keeps it running long enough to look.
+    rm -f "$wt/.fixloop/gate.json"
+    (cd "$wt" && SELFTEST_SLOW_SECS=8 "$PY" "$T/fix/gate.py" --start >/dev/null 2>&1)
+    gpid=$("$PY" -c 'import json,sys; print(json.load(open(sys.argv[1]))["pid"])' "$wt/.fixloop/gate.json" 2>/dev/null)
+    check "a started gate is kept awake: caffeinate holds a no-sleep assertion for it (pid ${gpid:-none})" \
+        wait_for 10 sh -c "[ -n '$gpid' ] && [ \"\$(awake_for '$gpid')\" -ge 1 ]"
+    wait_for 120 sh -c "cd '$wt' && '$PY' '$T/fix/gate.py' --status | grep -qE '^gate (PASS|FAIL)'"
+    check "... and lets go when the gate ends" wait_for 10 sh -c "[ -n '$gpid' ] && [ \"\$(awake_for '$gpid')\" = 0 ]"
+else
+    skip "the gate's keep-awake hold: macOS only here (systemd-inhibit on Linux, SetThreadExecutionState on Windows)"
+fi
 
 echo "== gate slots: one set for the machine, shared by every run and every project on it"
 check "by default the slots are one folder for the machine, outside every run (~/.laneloop/gate-slots)" "$PY" -B -c \
@@ -1114,6 +1388,118 @@ retire --apply --all-runs   # flags in either order
 check "retire --all-runs: retires the late merge of the run beside it" test ! -e "$R/r2-wt/late"
 check "retire --all-runs: ... keeping its state in that run's retired/" test -f "$R/r2/retired/late/status.json"
 check "retire --all-runs: ... and still keeps this run's open PR" test -d "$R/r1-wt/open"
+
+echo "== merge_base: a stacked branch merges the branch below it, and moves down once that one merges"
+mkdir -p "$R/mbbin" "$R/mb"
+cat > "$R/mbbin/gh" <<'EOF'
+#!/usr/bin/env bash
+# gh pr view <branch> ... --jq ...: prints what the filter would, from $SELFTEST_MB/<branch, / as _>; gh pr edit is logged
+# gh api .../stacks?pull_request=N: the stack holding PR N, from $SELFTEST_MB/stack_N, else none ([])
+echo "gh $*" >> "$SELFTEST_MB/gh.log"
+[ "$1 $2" = "pr view" ] && cat "$SELFTEST_MB/${3//\//_}" 2>/dev/null
+[ "$1" = api ] && { cat "$SELFTEST_MB/stack_${2##*=}" 2>/dev/null || echo '[]'; }
+[ "$1 $2" = "pr edit" ] && [ -n "${SELFTEST_MB_EDIT_FAIL:-}" ] && { echo "HTTP 403: Resource not accessible by integration" >&2; exit 1; }
+exit 0
+EOF
+chmod +x "$R/mbbin/gh"
+init fix "$R/r3" REPO="$R/repo" WT_ROOT="$R/r3-wt" BASE=develop MAX_SESSIONS=0
+git -C "$R/repo" fetch -q origin
+git -C "$R/repo" worktree add -q -b ai-work/stk-low "$R/r3-wt/stk-low" origin/develop 2>/dev/null
+git -C "$R/r3-wt/stk-low" commit -q --allow-empty -m low && git -C "$R/r3-wt/stk-low" push -q origin ai-work/stk-low 2>/dev/null
+git -C "$R/repo" worktree add -q -b ai-work/stk-up "$R/r3-wt/stk-up" origin/ai-work/stk-low 2>/dev/null
+git -C "$R/r3-wt/stk-up" commit -q --allow-empty -m up && git -C "$R/r3-wt/stk-up" push -q origin ai-work/stk-up 2>/dev/null
+mkdir -p "$R/r3-wt/stk-up/.fixloop" && echo ai-work/stk-low > "$R/r3-wt/stk-up/.fixloop/base"
+mb() { PATH="$R/mbbin:$PATH" SELFTEST_MB="$R/mb" bash "$R/r3/merge_base.sh" "${1:-stk-up}" > "$R/mb.out" 2>&1; }
+echo "OPEN develop" > "$R/mb/ai-work_stk-low"; echo "12 ai-work/stk-low" > "$R/mb/ai-work_stk-up"
+git -C "$R/r3-wt/stk-low" commit -q --allow-empty -m "low, after review" && git -C "$R/r3-wt/stk-low" push -q origin ai-work/stk-low 2>/dev/null
+mb
+check "while the branch below is open, a stacked branch merges it ($(head -c 80 "$R/mb.out"))" \
+    sh -c "git -C '$R/r3-wt/stk-up' merge-base --is-ancestor origin/ai-work/stk-low HEAD && [ \"\$(cat '$R/r3-wt/stk-up/.fixloop/base')\" = ai-work/stk-low ]"
+check "... and its PR isn't retargeted" sh -c "! grep -q 'pr edit' '$R/mb/gh.log'"
+git -C "$R/repo" checkout -q --detach origin/develop 2>/dev/null; git -C "$R/repo" merge -q --no-ff -m "Merge stk-low" origin/ai-work/stk-low 2>/dev/null
+git -C "$R/repo" push -q origin HEAD:develop 2>/dev/null; git -C "$R/repo" checkout -q develop 2>/dev/null
+echo "MERGED develop" > "$R/mb/ai-work_stk-low"
+head=$(git -C "$R/r3-wt/stk-up" rev-parse HEAD)
+SELFTEST_MB_EDIT_FAIL=1 mb; rc=$?
+check "a retarget that fails leaves the branch on the branch below and exits 4 (exit $rc, base $(cat "$R/r3-wt/stk-up/.fixloop/base"))" \
+    sh -c "[ $rc = 4 ] && [ \"\$(cat '$R/r3-wt/stk-up/.fixloop/base')\" = ai-work/stk-low ]"
+check "... saying INCOMPLETE and why ($(grep -m1 INCOMPLETE "$R/mb.out" | cut -c1-80))" grep -q "INCOMPLETE.*HTTP 403" "$R/mb.out"
+check "... and merges nothing" test "$(git -C "$R/r3-wt/stk-up" rev-parse HEAD)" = "$head"
+: > "$R/mb/gh.log"
+mb
+check "once the branch below merges, the branch moves down onto the base ($(grep -m1 'sits on' "$R/mb.out" | cut -c1-80))" \
+    sh -c "[ \"\$(cat '$R/r3-wt/stk-up/.fixloop/base')\" = develop ]"
+check "... retargets its PR to the base" grep -q "pr edit 12 --base develop" "$R/mb/gh.log"
+check "... and merges the base" git -C "$R/r3-wt/stk-up" merge-base --is-ancestor origin/develop HEAD
+
+echo "== merge_base: in a GitHub stack, GitHub moves the branch down itself; merge_base takes its rebase, never a merge"
+git -C "$R/repo" worktree add -q -b ai-work/stk-low2 "$R/r3-wt/stk-low2" origin/develop 2>/dev/null
+git -C "$R/r3-wt/stk-low2" commit -q --allow-empty -m low2 && git -C "$R/r3-wt/stk-low2" push -q origin ai-work/stk-low2 2>/dev/null
+git -C "$R/repo" worktree add -q -b ai-work/stk-up2 "$R/r3-wt/stk-up2" origin/ai-work/stk-low2 2>/dev/null
+git -C "$R/r3-wt/stk-up2" commit -q --allow-empty -m up2 && git -C "$R/r3-wt/stk-up2" push -q origin ai-work/stk-up2 2>/dev/null
+mkdir -p "$R/r3-wt/stk-up2/.fixloop" && echo ai-work/stk-low2 > "$R/r3-wt/stk-up2/.fixloop/base"
+old=$(git -C "$R/r3-wt/stk-up2" rev-parse HEAD)
+# GitHub merges the bottom PR, moves #13 onto the base and rebases (force-pushes) its branch there
+git -C "$R/repo" checkout -q --detach origin/develop 2>/dev/null; git -C "$R/repo" merge -q --no-ff -m "Merge stk-low2" origin/ai-work/stk-low2 2>/dev/null
+git -C "$R/repo" push -q origin HEAD:develop 2>/dev/null
+git -C "$R/repo" commit -q --allow-empty -m "up2 (rebased by GitHub)" && git -C "$R/repo" push -q -f origin HEAD:ai-work/stk-up2 2>/dev/null
+git -C "$R/repo" checkout -q develop 2>/dev/null
+git -C "$R/repo" update-ref refs/remotes/origin/ai-work/stk-up2 "$old"   # the chain's worktree hasn't fetched GitHub's rebase yet
+echo "MERGED develop" > "$R/mb/ai-work_stk-low2"; echo "13 develop" > "$R/mb/ai-work_stk-up2"
+echo '[{"number":8,"pull_requests":[{"number":13}]}]' > "$R/mb/stack_13"
+git -C "$R/r3-wt/stk-up2" commit -q --allow-empty -m "made here, never pushed"
+local_head=$(git -C "$R/r3-wt/stk-up2" rev-parse HEAD); : > "$R/mb/gh.log"
+mb stk-up2; rc=$?
+check "a local commit not pushed stops the sync (exit $rc): INCOMPLETE, rather than lose it ($(grep -m1 INCOMPLETE "$R/mb.out" | cut -c1-70))" \
+    sh -c "[ $rc = 4 ] && grep -q INCOMPLETE '$R/mb.out'"
+check "... the branch and its base are left as they were" \
+    sh -c "[ \"\$(git -C '$R/r3-wt/stk-up2' rev-parse HEAD)\" = $local_head ] && [ \"\$(cat '$R/r3-wt/stk-up2/.fixloop/base')\" = ai-work/stk-low2 ]"
+git -C "$R/r3-wt/stk-up2" reset -q --hard "$old"; : > "$R/mb/gh.log"
+mb stk-up2; rc=$?
+check "the stacked branch takes GitHub's rebase (exit $rc: $(tail -1 "$R/mb.out" | cut -c1-70))" \
+    sh -c "[ $rc = 0 ] && [ \"\$(git -C '$R/r3-wt/stk-up2' rev-parse HEAD)\" = \"\$(git -C '$R/r3-wt/stk-up2' rev-parse origin/ai-work/stk-up2)\" ]"
+check "... sits on the PR's live base" sh -c "[ \"\$(cat '$R/r3-wt/stk-up2/.fixloop/base')\" = develop ]"
+check "... and neither retargets its PR nor merges" sh -c "! grep -q 'pr edit' '$R/mb/gh.log' && ! git -C '$R/r3-wt/stk-up2' rev-parse -q --verify HEAD^2 >/dev/null"
+check "... nor asks GitHub for a stack it doesn't need once the branch was rebased" sh -c "! grep -q 'gh api' '$R/mb/gh.log'"
+rm -f "$R/mb/stack_13"; echo ai-work/stk-low2 > "$R/r3-wt/stk-up2/.fixloop/base"
+git -C "$R/r3-wt/stk-up2" reset -q --hard "$old"; git -C "$R/r3-wt/stk-up2" update-ref refs/remotes/origin/ai-work/stk-up2 "$old"
+mb stk-up2; rc=$?
+check "a branch GitHub rebased is synced even once its stack is gone (exit $rc)" \
+    sh -c "[ $rc = 0 ] && [ \"\$(git -C '$R/r3-wt/stk-up2' rev-parse HEAD)\" = \"\$(git -C '$R/r3-wt/stk-up2' rev-parse origin/ai-work/stk-up2)\" ]"
+echo '[{"number":8,"pull_requests":[{"number":13}]}]' > "$R/mb/stack_13"; echo ai-work/stk-low2 > "$R/r3-wt/stk-up2/.fixloop/base"
+head=$(git -C "$R/r3-wt/stk-up2" rev-parse HEAD); : > "$R/mb/gh.log"
+mb stk-up2; rc=$?
+check "in a stack GitHub moved but hasn't rebased yet: INCOMPLETE, nothing changed (exit $rc)" \
+    sh -c "[ $rc = 4 ] && grep -q \"hasn't rebased\" '$R/mb.out' && [ \"\$(git -C '$R/r3-wt/stk-up2' rev-parse HEAD)\" = $head ] && ! grep -q 'pr edit' '$R/mb/gh.log'"
+# the remote branch's reflog expired (or was never written): the tip origin/<branch> had before the fetch still counts as pushed
+echo ai-work/stk-low2 > "$R/r3-wt/stk-up2/.fixloop/base"
+git -C "$R/r3-wt/stk-up2" reset -q --hard "$old"; git -C "$R/r3-wt/stk-up2" update-ref refs/remotes/origin/ai-work/stk-up2 "$old"
+rm -f "$(git -C "$R/repo" rev-parse --absolute-git-dir)/logs/refs/remotes/origin/ai-work/stk-up2"
+logged=$(git -C "$R/r3-wt/stk-up2" reflog show --format=%H refs/remotes/origin/ai-work/stk-up2 2>/dev/null | wc -l | tr -d ' ')
+mb stk-up2; rc=$?
+check "with the remote branch's reflog gone ($logged entries), GitHub's rebase is still taken (exit $rc: $(tail -1 "$R/mb.out" | cut -c1-60))" \
+    sh -c "[ $logged = 0 ] && [ $rc = 0 ] && [ \"\$(git -C '$R/r3-wt/stk-up2' rev-parse HEAD)\" = \"\$(git -C '$R/r3-wt/stk-up2' rev-parse origin/ai-work/stk-up2)\" ]"
+
+echo "== fixloop: a branch whose parent merged (and was deleted) before it started is built from where the parent merged"
+git -C "$R/repo" worktree add -q -b ai-work/stk-gone "$R/gone" origin/develop 2>/dev/null
+git -C "$R/gone" commit -q --allow-empty -m gone && git -C "$R/gone" push -q origin ai-work/stk-gone 2>/dev/null
+git -C "$R/repo" checkout -q --detach origin/develop 2>/dev/null; git -C "$R/repo" merge -q --no-ff -m "Merge stk-gone" origin/ai-work/stk-gone 2>/dev/null
+git -C "$R/repo" push -q origin HEAD:develop 2>/dev/null; git -C "$R/repo" checkout -q develop 2>/dev/null
+git -C "$R/repo" worktree remove --force "$R/gone"; git -C "$R/repo" branch -q -D ai-work/stk-gone
+git -C "$R/repo" push -q origin --delete ai-work/stk-gone 2>/dev/null; git -C "$R/repo" fetch -q --prune origin
+echo "MERGED develop" > "$R/mb/ai-work_stk-gone"
+mkdir -p "$R/r3/briefs"
+printf '# Fix branch `stk-kid`\n\nPlan signed off: 2026-11-24 by Selftest\nStacked on: stk-gone\n' > "$R/r3/briefs/stk-kid.md"
+# MAX_SESSIONS=0: the chain sets up its worktree and stops before any session
+PATH="$R/mbbin:$PATH" SELFTEST_MB="$R/mb" bash "$R/r3/fixloop.sh" stk-kid > "$R/kid.out" 2>&1
+check "the child gets its worktree, from the base with the parent merged in ($(grep -m1 'stk-kid' "$R/r3/logs/runner.log" | cut -c1-100))" \
+    sh -c "git -C '$R/r3-wt/stk-kid' merge-base --is-ancestor origin/develop HEAD"
+check "... and sits on the base" sh -c "[ \"\$(cat '$R/r3-wt/stk-kid/.fixloop/base' 2>/dev/null)\" = develop ]"
+printf '# Fix branch `stk-kid2`\n\nPlan signed off: 2026-11-24 by Selftest\nStacked on: stk-low2\n' > "$R/r3/briefs/stk-kid2.md"
+echo "OPEN develop" > "$R/mb/ai-work_stk-low2"
+PATH="$R/mbbin:$PATH" SELFTEST_MB="$R/mb" bash "$R/r3/fixloop.sh" stk-kid2 > "$R/kid2.out" 2>&1
+check "a branch whose parent is open is built from the parent's branch, and sits on it" \
+    sh -c "git -C '$R/r3-wt/stk-kid2' merge-base --is-ancestor origin/ai-work/stk-low2 HEAD && [ \"\$(cat '$R/r3-wt/stk-kid2/.fixloop/base' 2>/dev/null)\" = ai-work/stk-low2 ]"
 
 echo "== crews: any agent and model per role, every agent driven the same way"
 # Stand-in agent CLIs: each answers in its own CLI's event format. SELFTEST_AGENT_MODE: plain (answers "done"), flood

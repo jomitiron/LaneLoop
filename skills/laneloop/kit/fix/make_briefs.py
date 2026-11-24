@@ -11,6 +11,11 @@ max_lines) with the plan's estimate: task.py refuses to open or hand over a pull
 overwrites a brief a chain already copied: a running branch reads .fixloop/brief.md, so change scope through a task.py
 note instead.
 
+Dependent branches ship as PR stacks; independent ones run in parallel. A branch that builds on another branch's code
+names it: "on": "<slug>". It is built on that branch, opens its PR against it, and the runner starts it once that branch
+has opened its PR. A branch with no "on" (or "on": null) depends on nothing: it is built from the base and starts at once,
+beside any stack. Every brief says "Stacked on: <slug>" (or "-" for the base).
+
 A plan imported from an EGM design (egm_plan.py import) adds to each brief: the design as the spec (path and hash), the
 files the branch may create or change (its boundary), the journeys it delivers, and the design's verification steps.
 """
@@ -61,6 +66,26 @@ def design_section(plan, b, design):
     return out
 
 
+def stack_parents(plan):
+    """slug -> the slug it is stacked on (None: independent, on the base). Only an explicit "on" stacks a branch.
+    Refuses a parent the plan doesn't have, and a loop."""
+    slugs = [b["slug"] for b in plan["branches"]]
+    parents = {}
+    for b in plan["branches"]:
+        on = b.get("on")
+        if on is not None and (on not in slugs or on == b["slug"]):
+            raise SystemExit(f"{b['slug']} is stacked on {on}, which isn't another branch in the plan")
+        parents[b["slug"]] = on
+    for s in slugs:
+        seen, p = [], s
+        while p is not None:
+            if p in seen:
+                raise SystemExit(f"the stack loops: {' -> '.join(seen + [p])}")
+            seen.append(p)
+            p = parents[p]
+    return parents
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("plan")
@@ -75,6 +100,7 @@ def main():
                          f"{plan.get('owner', 'the owner')} signs the page off, record it with sign_plan.py")
     defects = {d["id"]: d for d in plan.get("defects", [])}
     design = plan.get("design")
+    parents = stack_parents(plan)
     want = set(a.slugs.split(",")) if a.slugs else None
     picked = [b for b in plan["branches"] if (want is None or b["slug"] in want) and (a.wave is None or b.get("wave") == a.wave)]
     if not picked:
@@ -88,7 +114,7 @@ def main():
                        "sign-off (see the runbook's design-only section). No code.")
         if b.get("title"):
             out.append(f"Title: {b['title']}")
-        out += [f"Plan signed off: {signed['at']} by {signed['by']}",
+        out += [f"Plan signed off: {signed['at']} by {signed['by']}", f"Stacked on: {parents[b['slug']] or '-'}",
                 f"Defects: {', '.join(b.get('defects', [])) or 'none'} · tests to re-verify after merge: {', '.join(b.get('tests', [])) or 'none named'}",
                 f"Plan: {plan.get('plan_url', '-')} · results: {plan.get('results_url', '-')}"]
         if design:
@@ -105,7 +131,7 @@ def main():
                 line += f"; {plan.get('owner', 'the owner')} set this branch's own cap: {b['max_lines_why']}"
             out.append(line + ". See the runbook's size rule; `task.py size` measures it")
         if b.get("depends_on"):
-            out.append(f"Builds on: {', '.join(b['depends_on'])} (merged into the base before this branch started)")
+            out.append(f"Builds on: {', '.join(b['depends_on'])} (on the base, or below this branch in its stack, before it starts)")
         if plan.get("base_note"):
             out.append(plan["base_note"])
         out += ["", "## Scope and constraints (binding)", b.get("scope", ""), ""]

@@ -1,5 +1,6 @@
 """The pre-PR gate for a branch: every step project.json "gate.steps" names (builds, linters, test suites), in order.
-Run from the worktree root. It runs DETACHED (a full run outlasts a 10-minute tool call):
+Run from the worktree root. It runs DETACHED (a full run outlasts a 10-minute tool call) and keeps the computer awake
+until it ends (caffeinate on macOS, systemd-inhibit on Linux, SetThreadExecutionState on Windows):
 
   python $FIXLOOP/gate.py --start     start (or report the run already going)
   python $FIXLOOP/gate.py --status    one-line progress, then the verdict and failing tests when done
@@ -24,7 +25,7 @@ A gate over the limit waits, and --status (and gate.json "waiting") says for whi
 a step's services gets a port no other gate on the machine holds (its port + the lowest free offset), and is removed
 after (services.py). A slot or port whose gate died is freed for the next gate.
 """
-import json, os, re, subprocess, sys, time
+import json, os, re, shutil, subprocess, sys, time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, HERE)
@@ -209,6 +210,9 @@ def judge(step, r, log, rc):
 
 def run():
     os.makedirs(os.path.join(RUN, "logs"), exist_ok=True)  # before the first save: a plain worktree has no .fixloop yet
+    if WINDOWS and keep_awake_on():  # no idle sleep while this thread holds it (macOS and Linux: start() wraps the gate)
+        import ctypes
+        ctypes.windll.kernel32.SetThreadExecutionState(0x80000000 | 0x00000001)   # ES_CONTINUOUS | ES_SYSTEM_REQUIRED
     s = {"pid": os.getpid(), "started": time.strftime("%H:%M:%S"), "step": None, "steps": {}, "verdict": "running",
          "skipped": sorted(SKIP & {x.get("name") for x in steps()})}
     save(s)
@@ -295,6 +299,31 @@ def status():
                     print(f"     {h.get('say', '')} (doctor: {PY} {HERE}/doctor.py)")
 
 
+def keep_awake_on():
+    return os.environ.get("LANELOOP_KEEP_AWAKE", os.environ.get("METALOOP_KEEP_AWAKE", "1")) != "0"
+
+
+def awake_wrapper():
+    """What the detached gate runs under to keep the computer awake until it ends (platform.sh keep_awake's tools): a gate
+    is often started straight from a session or merge_base.sh, not through launch.sh, and an idle sleep stalls it
+    mid-suite. macOS: caffeinate -is (system sleep held only on mains power). Linux: systemd-inhibit, when it may take the
+    hold (a container or CI runner may have it and be refused: then nothing, never a gate that can't start). Windows:
+    run() holds SetThreadExecutionState itself. A closed laptop lid still sleeps the computer."""
+    if WINDOWS or not keep_awake_on():
+        return []
+    if sys.platform == "darwin":
+        return ["caffeinate", "-is"] if shutil.which("caffeinate") else []
+    inhibit = shutil.which("systemd-inhibit")
+    hold = [inhibit, "--what=idle:sleep", "--who=LaneLoop", "--mode=block"] if inhibit else []
+    try:
+        if hold and subprocess.run(hold + ["--why=checking", "true"], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+                                   timeout=10).returncode == 0:
+            return hold + ["--why=a LaneLoop gate is running"]
+    except (OSError, subprocess.SubprocessError):
+        pass
+    return []
+
+
 def start():
     s = load()
     if s and s.get("verdict") == "running" and pid_alive(s.get("pid")):
@@ -305,8 +334,9 @@ def start():
     # doesn't fill with a window per step. POSIX: a session of its own, so the gate outlives the session (and its process
     # group) that started it.
     detach = {"creationflags": NO_WINDOW | 0x00000200} if WINDOWS else {"start_new_session": True}  # | CREATE_NEW_PROCESS_GROUP
-    subprocess.Popen([sys.executable, os.path.abspath(__file__), "--run"], cwd=ROOT, stdout=subprocess.DEVNULL, stderr=err,
-                     stdin=subprocess.DEVNULL, close_fds=True, **detach)
+    # The wrapper runs the gate as its child and lets go when it ends; gate.json records the gate's own pid.
+    subprocess.Popen(awake_wrapper() + [sys.executable, os.path.abspath(__file__), "--run"], cwd=ROOT,
+                     stdout=subprocess.DEVNULL, stderr=err, stdin=subprocess.DEVNULL, close_fds=True, **detach)
     time.sleep(3)
     if load() is None:
         print("gate did not start; see .fixloop/logs/gate-runner.err"); return

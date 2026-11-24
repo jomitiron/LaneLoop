@@ -1,5 +1,7 @@
 #!/usr/bin/env bash
-# Runs the branches listed in a queue file as parallel chains, MAX_PAR at a time; starts the next as one ends.
+# Runs the branches listed in a queue file as parallel chains, MAX_PAR at a time; starts the next as one ends. A branch
+# stacked on another (its brief's "Stacked on:") starts once that one has opened its pull request. Keeps the computer
+# awake while it runs.
 # Every chain end (and the runner's own end) is written to logs/runner.log and raised as a toast.
 #   QUEUE=queue.txt MAX_PAR=5 ./runner.sh          (start.sh opens it in its own window)
 #   ./runner.sh --preflight-only                   check the code and plan pins and stop
@@ -56,6 +58,9 @@ if [ -n "${PR_LABEL:-}" ]; then
         notify "Runner stopped" "could not create the PR label $PR_LABEL"; exit 1
     fi
 fi
+# Chains run unattended for hours: keep the computer awake for as long as this runner lives, however it was started
+# (launch.sh holds it too, but a runner started any other way had nothing).
+keep_awake $$ "LaneLoop is running the run's chains"
 SLUGS=(); PIDS=()   # the running chains: SLUGS[k] runs as PIDS[k]
 
 reap() {  # log every chain that has ended and drop it from the running lists
@@ -69,16 +74,48 @@ reap() {  # log every chain that has ended and drop it from the running lists
     SLUGS=(${s[@]+"${s[@]}"}); PIDS=(${p[@]+"${p[@]}"})
 }
 
-i=0
-while [ "$i" -lt "${#Q[@]}" ] || [ "${#PIDS[@]}" -gt 0 ]; do
+# PR stacks: a branch whose brief says "Stacked on: <slug>" starts only once that branch has opened its pull request (its
+# branch is on origin to build from); a parent that ended without one means it never starts, and the log says why.
+# A design branch on a design branch starts once that one has pushed its page: a design chain pushes, then ends
+# awaiting_owner with no PR. A build branch on a design branch still waits for its PR.
+brief_of() { if [ -f "$WT_ROOT/$1/.fixloop/brief.md" ]; then echo "$WT_ROOT/$1/.fixloop/brief.md"; else echo "briefs/$1.md"; fi; }
+parent_of() { sed -n 's/^Stacked on: \([^ ]*\).*/\1/p' "$(brief_of "$1")" 2>/dev/null | tr -d '\r' | head -n 1; }
+has_pr() {  # its worktree's state, or the state retire.sh kept once it merged
+    local f; for f in "$WT_ROOT/$1/.fixloop/status.json" "retired/$1/status.json"; do
+        [ -f "$f" ] && "$PYTHON" -c "import json,sys; sys.exit(0 if json.load(open(sys.argv[1],encoding='utf8')).get('pr') else 1)" "$f" 2>/dev/null && return 0
+    done; return 1
+}
+pin_of() {  # plan: a design branch not signed off yet (task.py pin); its worktree's state once started, else its brief
+    if [ -f "$WT_ROOT/$1/.fixloop/status.json" ] && [ -f "$WT_ROOT/$1/.fixloop/brief.md" ]; then
+        (cd "$WT_ROOT/$1" && "$PYTHON" "$ROOT/task.py" pin 2>/dev/null)
+    else "$PYTHON" "$ROOT/task.py" pin "$(brief_of "$1")" 2>/dev/null; fi
+}
+page_pushed() {  # <design parent>: its chain ended awaiting the owner (task.py ready, after the push)
+    [ "$(pin_of "$1")" = plan ] && [ "$(cd "$WT_ROOT/$1" 2>/dev/null && "$PYTHON" "$ROOT/task.py" status 2>/dev/null)" = awaiting_owner ]
+}
+below_ready() {  # <slug> <parent>: the parent has what the branch builds on
+    has_pr "$2" || { [ "$(pin_of "$1")" = plan ] && page_pushed "$2"; }
+}
+listed() { local x w="$1"; shift; for x in "$@"; do [ "$x" = "$w" ] && return 0; done; return 1; }
+P=(${Q[@]+"${Q[@]}"})   # queued, not started yet
+while [ "${#P[@]}" -gt 0 ] || [ "${#PIDS[@]}" -gt 0 ]; do
     reap
-    while [ "${#PIDS[@]}" -lt "$MAX_PAR" ] && [ "$i" -lt "${#Q[@]}" ]; do
-        slug="${Q[$i]}"; i=$((i + 1))
+    rest=()
+    for slug in ${P[@]+"${P[@]}"}; do
+        parent=$(parent_of "$slug")
+        if [ -n "$parent" ] && [ "$parent" != - ] && ! below_ready "$slug" "$parent"; then
+            if listed "$parent" ${P[@]+"${P[@]}"} ${SLUGS[@]+"${SLUGS[@]}"}; then rest+=("$slug"); continue; fi
+            log "not started: $slug: stacked on $parent, which ended without a pull request"
+            notify "Chain not started: $slug" "stacked on $parent, which has no pull request"; continue
+        fi
+        if [ "${#PIDS[@]}" -ge "$MAX_PAR" ]; then rest+=("$slug"); continue; fi
         ./fixloop.sh "$slug" &
         SLUGS+=("$slug"); PIDS+=("$!")
-        log "chain started: $slug (pid $!)"
+        on=""; [ -n "$parent" ] && [ "$parent" != - ] && on=" · stacked on $parent"
+        log "chain started: $slug (pid $!)$on"
         sleep "$STAGGER_SECS"
     done
+    P=(${rest[@]+"${rest[@]}"})
     [ "${#PIDS[@]}" -gt 0 ] && sleep "$POLL_SECS"
 done
 log "all chains ended"

@@ -5,7 +5,7 @@ off). The plan sizes every build branch under the cap, and a chain checks its br
   python pr_size.py plan plan.json     each build branch's estimate against its cap
 
 A pull request's size is the lines it adds plus the lines it removes, tests included, as GitHub counts them, against the
-merge base with origin/<base>. Uncommitted and untracked work counts too, so a chain sees the size before it commits. A
+merge base with origin/<base> (for a stacked branch, the branch below it: .fixloop/base). Uncommitted and untracked work counts too, so a chain sees the size before it commits. A
 moved file counts only the lines that changed in it. Not counted: lockfiles, snapshots and minified files, files that
 .gitattributes marks linguist-generated or linguist-vendored, binary files, the signed-off mockup and schema pages
 (MOCKUPS_DIR, SCHEMA_DIR: the owner reviewed those on their own page), and the project profile's pr_size.exclude globs.
@@ -150,6 +150,11 @@ def why_not_counted(path, extra, c, marked):
 def count(wt, base=None, c=None, profile=None):
     """This branch's size: {added, removed, total, files [(path, added, removed)], skipped [(path, why)], base}."""
     c = conf() if c is None else c
+    if not base:   # a stacked branch's PR shows only its own diff against the branch below it (.fixloop/base)
+        try:
+            base = open(os.path.join(wt, ".fixloop", "base"), encoding="utf8").read().strip()
+        except OSError:
+            pass
     base = base or c.get("BASE") or "develop"
     if profile is None:
         try:

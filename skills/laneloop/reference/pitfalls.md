@@ -75,6 +75,10 @@ Each entry is a failure seen in a real run. Symptom → cause → fix.
   test accounts go with them. → The verify loop's services keep their data in a `persist` folder under `~/.laneloop/`.
 - **An unattended run stopped overnight.** → The Mac slept. → `launch.sh` runs loops under `caffeinate -is` and refuses
   on battery, where caffeinate can't hold the Mac awake. A closed lid still sleeps it.
+- **Three gates stalled mid-suite while the owner was away.** → They were started straight from the orchestrator and
+  `merge_base.sh --commit`, not through `launch.sh`, so nothing held the Mac awake; only the display being on did. →
+  `gate.py --start` runs the gate under `caffeinate -is` (systemd-inhibit on Linux, `SetThreadExecutionState` on
+  Windows), and `runner.sh` keeps the computer awake for as long as it lives (`keep_awake`), however either was started.
 - **Chains and PR checks went unwatched once the loops ended, and the computer slept.** → Only the loops held it awake;
   the orchestrator's watchers didn't, and the desktop app's own keep-awake lets go once the session goes idle. On
   waking, wall-clock timeouts fired at once: a session killed as a runaway, a watcher reporting TIMEOUT. → Every watcher
@@ -120,6 +124,33 @@ Each entry is a failure seen in a real run. Symptom → cause → fix.
 - **Every check failed in 2 to 3 seconds with zero steps.** → The GitHub Actions budget, not the code.
 - **Commits pushed after a merge never reached the base.** → The PR was already merged; only push-triggered jobs ran. →
   After a merge batch, compare each merged PR's head with its branch tip.
+- **One feature's parallel PRs kept conflicting with each other and with the base.** → Branches that built on each
+  other were ordinary PRs off the base, so every merge reopened conflicts in the others. → A branch that builds on
+  another is stacked on it (`"on"` in the plan, `Stacked on:` in its brief, `.fixloop/base` in its worktree), while
+  independent branches still run in parallel; the runner starts a stacked branch once the one below has a PR; `merge_base.sh` updates a stack bottom-up and moves a branch
+  down, retargeting its PR, once the branch below merges.
+- **Stacked PRs got no review, security or size checks.** → The repository's workflows ran only on PRs whose base is the
+  default branch (`pull_request: branches: [main]`). → Every such filter also takes the run's branch prefix
+  (`ai-work/**`), or drops the filter.
+- **A design branch stacked on a design branch never started.** → The runner waited for the parent's PR, and a design
+  chain opens none: it pushes its page and ends awaiting the owner. → A design branch on a design branch starts once
+  that one ends awaiting the owner; a build branch on it still waits for a PR.
+- **A branch whose parent merged before it started got no worktree.** → `fixloop.sh` fetched the parent's branch, which
+  had been deleted after the merge. → It builds on what the parent merged into, as `merge_base.sh` does.
+- **`merge_base.sh` moved a branch down while its PR still targeted the merged branch.** → It wrote `.fixloop/base`
+  before `gh pr edit` and ignored a failure. → The new base is kept only once the retarget succeeds; otherwise it prints
+  INCOMPLETE with gh's reason, merges nothing and exits 4.
+- **Chains made base-chained PRs, never a GitHub stack, and the owner stacked them by hand.** → `task.py pr` only
+  checked the base. → It also makes or extends the GitHub stack with the PR below. Two things change once PRs are
+  stacked: `gh pr merge` refuses a stacked PR (merge from the PR page, or `merge-async`), and when a PR below merges
+  GitHub retargets the next PR and rebases (force-pushes) its branch, so a merge on top of the old local branch can't
+  be pushed. → `merge_base.sh` takes GitHub's rebase instead (stopping on unpushed local commits); nobody force-pushes a
+  stacked branch.
+- **A GitHub rebase could read as "not rebased yet" forever.** → `merge_base.sh` knew the remote branch's old tips only
+  from the reflog of `origin/<branch>`, which expires. → It also counts that ref's tip before the fetch, the way
+  `push --force-with-lease` tells a rewrite. In the same review: `task.py pr` retries a read that hits a passing outage
+  (5xx, rate limit, timeout) 3 times before refusing, and with no `BASE` in loop.json it makes no stack call (noted)
+  rather than take the trunk for a branch below.
 
 ## The orchestrator
 

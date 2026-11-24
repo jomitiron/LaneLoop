@@ -28,6 +28,9 @@ Gemini, planning on Codex, coding on Claude, or any mix you choose.
 - **Any agent, per role.** A run's crew pins an agent, model and effort for each role: research, plan, code and
   verify. Claude Code, Codex, Antigravity, Gemini CLI, Grok Build, OpenCode (any provider's model) and Cursor are all
   driven the same way. The ready-made crews are chosen from current benchmarks, SlopCodeBench among them.
+- **PR stacks where work depends.** A branch that builds on another is stacked on it (built on it, its PR against it,
+  in a GitHub stack the owner merges as one), so dependent PRs stop conflicting with each other. Independent branches
+  run in parallel beside the stacks.
 - **Parallel.** Each branch is its own chain of headless sessions in its own git worktree, five at a time by default,
   each with a tab on the session's one live page, where the owner follows its progress and answers its questions,
   under a dashboard of the whole run and every pull request it opened (they all carry the run's label).
@@ -189,7 +192,7 @@ split, and orchestrates the chains that build it.
 |---|---|
 | Design (EGM) | `/egm:egm-brainstorm` → `/egm:egm-draft` → `/egm:egm-review` and `/egm:egm-resolve` → the owner approves and the design is merged |
 | Hand-off | `egm_plan.py import` → branches drawn up, each sized for one PR under the cap → `egm_plan.py check` → fan-out Goldfish review → the owner signs off |
-| Build (LaneLoop) | `make_briefs.py` → parallel chains (red, green, docs, gate, security, PR, CI) → review items → the owner merges |
+| Build (LaneLoop) | `make_briefs.py` → parallel chains, dependent ones stacked (red, green, docs, gate, security, PR, CI) → review items → the owner merges |
 | After merge | `/egm:egm-drift-report` → the owner updates the design doc or the code → re-verify |
 
 The full procedure is in [reference/egm.md](skills/laneloop/reference/egm.md). `PLANNER=grill` plans the original way,

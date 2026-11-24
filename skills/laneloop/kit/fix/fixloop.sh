@@ -19,17 +19,32 @@ export FIXLOOP="$ROOT"
 mkdir -p "$ROOT/logs"
 log() { echo "[$(date '+%m-%d %H:%M:%S')] [$SLUG] $*" | tee -a "$ROOT/logs/$SLUG.log" >> "$ROOT/logs/runner.log"; }
 
+# PR stacks: the brief's "Stacked on: <slug>" is the branch this one builds on and opens its PR against; "-" is the base.
+# .fixloop/base keeps it for the sessions, task.py pr and merge_base.sh (which moves it down once the branch below merges).
+brief="$WT/.fixloop/brief.md"; [ -f "$brief" ] || brief="$ROOT/briefs/$SLUG.md"
+parent=$(sed -n 's/^Stacked on: \([^ ]*\).*/\1/p' "$brief" 2>/dev/null | tr -d '\r' | head -n 1)
+if [ -n "$parent" ] && [ "$parent" != - ]; then FROM="${BRANCH_PREFIX}${SLUG_PREFIX}${parent}"; else FROM="$BASE"; fi
+if [ ! -d "$WT" ] || [ ! -s "$WT/.fixloop/base" ]; then
+    # The branch below merged before this one started (retire.sh then deletes it): build on what it merged into, as
+    # merge_base.sh does
+    while [ "$FROM" != "$BASE" ]; do
+        below=$(gh pr view "$FROM" --repo "$GH_REPO" --json state,baseRefName --jq '"\(.state) \(.baseRefName)"' 2>/dev/null)
+        [ "${below%% *}" = MERGED ] || break
+        log "$FROM has merged into ${below#* }: building on ${below#* }"; FROM="${below#* }"
+    done
+fi
 if [ ! -d "$WT" ]; then
-    git -C "$REPO" fetch -q origin "$BASE"
+    git -C "$REPO" fetch -q origin "$FROM" || { log "STOP: stacked on $FROM, which isn't on origin yet"; exit 1; }
     if git -C "$REPO" show-ref --quiet "refs/heads/$BR"; then
         git -C "$REPO" worktree add -q "$WT" "$BR" || { log "STOP: worktree add failed"; exit 1; }
     else
-        git -C "$REPO" worktree add -q -b "$BR" "$WT" "origin/$BASE" || { log "STOP: worktree add failed"; exit 1; }
+        git -C "$REPO" worktree add -q -b "$BR" "$WT" "origin/$FROM" || { log "STOP: worktree add failed"; exit 1; }
     fi
-    log "worktree $WT on $BR from $(git -C "$WT" rev-parse --short HEAD)"
+    log "worktree $WT on $BR from $FROM at $(git -C "$WT" rev-parse --short HEAD)"
 fi
 cd "$WT" || exit 1
 mkdir -p .fixloop/state .fixloop/logs .fixloop/handoffs
+[ -s .fixloop/base ] || echo "$FROM" > .fixloop/base
 [ -f .fixloop/brief.md ] || cp "$ROOT/briefs/$SLUG.md" .fixloop/brief.md || { log "STOP: no briefs/$SLUG.md"; exit 1; }
 [ -f .fixloop/status.json ] || "$PYTHON" -c "
 import json; json.dump({'slug':'$SLUG','branch':'$BR','status':'todo','phase':None,'pr':None,'notes':[],'reviews':[],'summary':''},

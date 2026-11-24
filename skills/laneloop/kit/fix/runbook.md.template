@@ -5,8 +5,12 @@
 
 You are one session in a chain that delivers ONE task on ONE branch. {{OWNER}} approved the plan and this branch's scope
 (FILL IN: date and the plan link). Your working directory is the branch's own git worktree, already on
-`{{BRANCH_PREFIX}}{{SLUG_PREFIX}}<slug>` off `{{BASE}}`. Everything that must survive between sessions lives in `.fixloop/`
-(gitignored): `brief.md` (your task), `status.json` (via task.py), `HANDOFF.md`, `gate.json`.
+`{{BRANCH_PREFIX}}{{SLUG_PREFIX}}<slug>`, built on **your base**: the branch named in `.fixloop/base`. Features ship as
+PR stacks, never as parallel PRs off `{{BASE}}`: your branch sits on the branch below it in the stack (the brief's
+"Stacked on:"), and only the bottom of a stack sits on `{{BASE}}`. Everything that must survive between sessions lives in
+`.fixloop/` (gitignored): `brief.md` (your task), `status.json` (via task.py), `HANDOFF.md`, `gate.json`, `base`. Read your
+base with `cat .fixloop/base` and type it into each command where this runbook says `<base>` (a command with `$(...)` may be
+refused).
 
 ## Standing overrides for this unattended run
 
@@ -64,7 +68,7 @@ Run task.py and gate.py with these exact paths (they are allow-listed): `{{PYTHO
    `{{PYTHON}} {{RUN}}/task.py wait 300` between polls (it takes a while; every branch and run on the machine shares the test slots, and `--status` says when it waits).
    If the verdict line says a check was "not checked on this machine" ({{OWNER}}'s decision, loop.conf GATE_SKIP), that is
    a pass for this phase, never yours to change: the pr and ci phases below say what it costs.
-   Unexpected failures: fix them if your change caused them; if they also fail on {{BASE}}, note it and carry on.
+   Unexpected failures: fix them if your change caused them; if they also fail on your base, note it and carry on.
    A "known flaky" test must pass when run alone: run it filtered and say so. A test the gate lists as failing "on this
    platform every time" is not re-run: it can't pass on this machine, and CI runs it. A build that is incomplete, a filtered grep
    that "shows nothing" or a suite that ran zero tests is not a pass: read the gate's verdict.
@@ -72,16 +76,26 @@ Run task.py and gate.py with these exact paths (they are allow-listed): `{{PYTHO
 6. **pr**: if `task.py phase pr` is refused because a question is still open, finish with
    `task.py needs "holding the pull request until {{OWNER}} answers Q<n>"`: nothing is published on an assumption. If
    it is refused for size, finish with the size rule's `needs`.
-   `git fetch origin` and `git merge origin/{{BASE}}` (resolve conflicts, then re-run the gate if anything merged);
-   `git push -u origin <branch>`; `gh pr create --base {{BASE}}{{PR_LABEL_ARG}} --title "<conventional title, no tool names>" --body-file .fixloop/pr-body.md`
-   (the label marks every pull request of this run; the runner made it before any chain started).
-   The body stands on its own: what was wrong (defect ids, the tests that showed it), what changed,
+   `git fetch origin` and `git merge origin/<base>` (resolve conflicts, then re-run the gate if anything merged);
+   `git push -u origin <branch>`; `gh pr create --base <base>{{PR_LABEL_ARG}} --title "<conventional title, no tool names>" --body-file .fixloop/pr-body.md`
+   (the label marks every pull request of this run; the runner made it before any chain started). Never
+   `--base {{BASE}}` for a branch that is stacked: its PR shows only its own diff against the branch below it.
+   The body stands on its own. A stacked branch's body opens with `Stacked on #<N> (<base>): merge that first.`
+   (`gh pr view <base> --json number`). Then: what was wrong (defect ids, the tests that showed it), what changed,
    tests added, docs touched, what to re-verify after merge, and links to the plan and results pages as extra context
    only. If the gate left a step out (GATE_SKIP), the body says so in a "Not checked locally" line naming the step and
    what checks it instead (the gate's status prints the step's note). End it with
    `{{PR_FOOTER}}`. Commit messages end with
    `{{COMMIT_TRAILER}}`. If the repository's instructions ask for
-   anything alongside a PR (a changelog entry, a tracking file), add it, commit and push. `task.py pr <N> <url>`.
+   anything alongside a PR (a changelog entry, a tracking file), add it, commit and push. `task.py pr <N> <url>`: it reads
+   the PR's base from GitHub and, if it isn't `<base>`, retargets the PR there and notes it. A read that hits a passing
+   GitHub outage (5xx, rate limit, timeout) is tried 3 times, 5 s apart. If it still can't read or retarget it (or no
+   branch is checked out), it records nothing and exits non-zero: fix what it says (the number, usually) and run it
+   again; the pr phase isn't done until it says `ok`. On a branch that is stacked (not the bottom) it also puts the PR in
+   a GitHub stack with the PR below it (made, or added on top); a second PR on the same parent stays base-chained (GitHub
+   stacks are linear) and the note says so. If GitHub refuses the stack, the PR is still recorded, base-chained, and the
+   note says why: carry on. Never merge a PR and never force-push: after a PR below merges, GitHub moves and rebases this
+   branch itself, and the main session re-syncs it.
 7. **ci**: poll `gh pr checks <N>` (with `task.py wait 300`) until checks settle or ~45 minutes pass. A check that fails in
    2 to 3 s with zero steps is a GitHub Actions budget block, not your code: note it. A review bot that "passes" in seconds
    on a later push reviewed nothing new: note it. Then read every comment with `{{PYTHON}} {{RUN}}/pr_read.py <N> comments`,
@@ -97,7 +111,7 @@ Run task.py and gate.py with these exact paths (they are allow-listed): `{{PYTHO
 
 If `task.py show` has a note starting `APPROVED REVIEW ITEMS`, the PR already exists. Apply exactly the items it lists, as
 their recorded proposals describe (or as the note amends them), nothing else: test-first where behaviour changes (phases
-red and green again), `git merge origin/{{BASE}}` if it moved, run the gate, push to the same branch (no new PR), then poll
+red and green again), `git merge origin/<base>` if it moved, run the gate, push to the same branch (no new PR), then poll
 CI as in phase 7, record any NEW review comments as proposals, and finish with
 `task.py ready "<pushed: commit ids per item; CI state; N new review items>"`. The size cap still holds: run
 `task.py size` before you push. If the items take the pull request over its cap, push only the items that fit and stop
@@ -150,8 +164,8 @@ the choices that note lists. That note overrides the brief's "Mode: design" and 
   phase. A migration or backfill the page specifies is written (and unit-tested when the page says so) but never run
   against any database; the PR lists the run order around the deploy.
 - Then phases 1 to 7 as usual, under the brief's size cap (the signed-off pages themselves don't count). In the pr
-  phase, change this branch's README row(s) from "Building on" to "Built in [PR #N](url)". {{BASE}} may have moved since
-  the design was drawn: `git merge origin/{{BASE}}` before red, and again before pr.
+  phase, change this branch's README row(s) from "Building on" to "Built in [PR #N](url)". Your base may have moved since
+  the design was drawn: `git merge origin/<base>` before red, and again before pr.
 
 ## Context guard and hand-off
 

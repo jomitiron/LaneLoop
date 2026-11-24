@@ -52,7 +52,8 @@ anything (see [reference/orchestrator.md](../reference/orchestrator.md), "Missin
   `START_SERVER=0` against an app someone runs elsewhere).
 - **Windows:** Git Bash with `mintty` and `cygpath`; PowerShell keeps the computer awake (`keep_awake.ps1`).
 - **macOS:** `tmux` (or the `screen` macOS ships) for detached runs; mains power and an open lid for unattended runs
-  (`launch.sh` runs them under `caffeinate` and refuses on battery). Nothing else: no Homebrew bash, no `python` shim.
+  (`launch.sh`, `runner.sh` and the gate run under `caffeinate` themselves; `launch.sh` refuses on battery). Nothing
+  else: no Homebrew bash, no `python` shim.
 - **Linux:** `tmux` or `screen`; `systemd-inhibit` (systemd) keeps the computer awake.
 - **Every platform:** loops and the orchestrator's watchers hold the computer awake while they run. A closed laptop lid
   still sleeps it; if it sleeps anyway, the watchers say so on waking and nothing counts the lost time.
@@ -105,7 +106,7 @@ Machine fallbacks (doctor.py says when each applies):
 | `consult.py <role> <name> "<question>"` | A read-only question to a role's pin (research, or plan for reviews), answered in `consults/<name>.md`; `--batch` runs many at once. |
 | `agents.json` | The agents the kit drives and the models it knows: windows, efforts, prices, dated benchmark notes. |
 | `launch.sh <name> <start.sh> [args]` | Starts a loop without taking focus and keeps the computer awake under it: minimised mintty (Windows), detached tmux or screen (macOS under caffeinate, Linux under systemd-inhibit). |
-| `platform.sh` | Sourced by every shell script: the Windows calls (cygpath, toasts, netstat, taskkill, PowerShell) and their macOS / Linux equivalents, and `keep_awake`, `nap` and `slept_since`, which keep the computer awake and notice when it slept. |
+| `platform.sh` | Sourced by every shell script: the Windows calls (cygpath, toasts, netstat, taskkill, PowerShell) and their macOS / Linux equivalents, and `keep_awake`, `nap` and `slept_since`, which keep the computer awake and notice when it slept (on Windows, with no readable Windows pid for the process, `keep_awake` holds nothing and says so on stderr and in a toast). |
 | `ctx_guard.py`, `session_result.py`, `notify.ps1`, `keep_awake.ps1` | Claude Code's context and model guard (a hook); a Claude Code session log's result line; the Windows toast; the Windows keep-awake hold. |
 | `live_page.py`, `live_page.html` | The orchestrator session's one live page: a dashboard (the run's PR label linked to its pull requests, what is running, what needs the owner, PRs open and merged, cost) over a tab per task. `live_page.py <tab>...` adds this run's tabs (chain slugs, or `verify`) and writes `live/session.live.html` in the run folder, never committed (the repo ignores `*.live.html`); `--url` records where the session's page is published (a later run of the same session records the same url, and never publishes its own); `--plan-url` links the plan page. It draws itself from its own database. |
 | `live_sync.py` | The writes that keep this run's tabs current (state, lines, questions, review items) and its dashboard entry, for the main session's ArtifactData batch; `--done` once written; `--attention` prints the main window's one line per thing a tab needs, with the page's link. |
@@ -130,16 +131,16 @@ Machine fallbacks (doctor.py says when each applies):
 
 | File | What |
 |---|---|
-| `plan.example.json` → `plan.json` | Defects, decisions, branches by wave. |
-| `egm_plan.py import\|check\|render\|boundary` | The hand-off from EGM ([reference/egm.md](../reference/egm.md)): imports an approved EGM design doc into `plan.json` (goals, journeys, files, verification); checks the branches drawn from it (design on the base, every file owned once per wave, every journey delivered, dependencies in earlier waves); renders the split as `fanout.md` for the Goldfish review; lists what a chain changed outside its files. |
+| `plan.example.json` → `plan.json` | Defects, decisions, branches by wave; `"on": "<slug>"` stacks a branch on the one it builds on, and a branch without it runs in parallel. |
+| `egm_plan.py import\|check\|render\|boundary` | The hand-off from EGM ([reference/egm.md](../reference/egm.md)): imports an approved EGM design doc into `plan.json` (goals, journeys, files, verification); checks the branches drawn from it (design on the base, every file owned once per wave, every journey delivered, dependencies in earlier waves); renders the split as `fanout.md` for the Goldfish review; lists what a chain changed outside its files (a stacked branch: on top of the branch below it). |
 | `plan.egm.example.json` | A plan imported from an EGM design, with its branches drawn up (`files`, `cujs`, `depends_on`). |
 | `fanout_readiness.md`, `fanout-readiness-standard.md` | The Goldfish reviewer and standard `/egm:egm-review-loop` uses on `fanout.md`: hidden coupling within a wave, unowned work, missing dependencies, boundaries too narrow for their tests. |
 | `plan_page.py`, `plan_page.html` | The plan page: the owner answers each grilling round on it, reads the plan (branches by wave, each broken into tasks with its proving test) and signs it off. Answers and sign-off live in the page's database. |
 | `sign_plan.py` | Records the owner's sign-off in `plan.json`; refuses while a decision is open, a branch has no tasks, or a build branch is unsized (`est_lines`) or over its PR size cap. |
 | `make_briefs.py` | `briefs/<slug>.md` (with the branch's title, tasks, a `Plan signed off:` line and its `Size cap:`) and a queue file, from a signed-off plan only. The runner starts no branch whose brief lacks that line. |
-| `pr_size.py` | A pull request's size: `count` measures a branch (added plus removed lines, tests included; lockfiles, generated files and signed-off pages left out) against its cap, `plan` lists every branch's estimate against `PR_MAX_LINES`. `sign_plan.py`, `egm_plan.py check` and `task.py` use it. |
-| `start.sh <queue> [MAX_PAR]`, `runner.sh`, `fixloop.sh` | Run a queue of chains in parallel; one chain of sessions per branch. The runner makes the run's PR label (`PR_LABEL`) before the first chain starts, and stops if it can't. |
-| `task.py`, `gate.py` | A branch's state (`task.py pin`: the plan or code pin its next session runs on; `ask` / `answer`: a question for the owner that doesn't stop the chain, and the answer from its tab of the session page; `done`: a task ticked; `size`: the branch against its PR size cap, which the pr phase and `ready` enforce; `cap`: a cap the owner raised mid-run); the pre-PR gate (the profile's gate steps, detached, slot-limited by slots every run on the machine shares, each slot with its own services; `--status` names the slot a gate waits for and who holds it). |
+| `pr_size.py` | A pull request's size: `count` measures a branch (added plus removed lines, tests included; lockfiles, generated files and signed-off pages left out; a stacked branch against the branch below it) against its cap, `plan` lists every branch's estimate against `PR_MAX_LINES`. `sign_plan.py`, `egm_plan.py check` and `task.py` use it. |
+| `start.sh <queue> [MAX_PAR]`, `runner.sh`, `fixloop.sh` | Run a queue of chains in parallel; one chain of sessions per branch. The runner makes the run's PR label (`PR_LABEL`) before the first chain starts, and stops if it can't, and keeps the computer awake while it lives. A stacked branch starts once the one below has opened its PR (a design branch on a design branch: once that one has pushed its page); one whose parent already merged is built from what the parent merged into. |
+| `task.py`, `gate.py` | A branch's state (`task.py pin`: the plan or code pin its next session runs on; `ask` / `answer`: a question for the owner that doesn't stop the chain, and the answer from its tab of the session page; `done`: a task ticked; `size`: the branch against its PR size cap, which the pr phase and `ready` enforce; `cap`: a cap the owner raised mid-run; `pr`: the PR, recorded only once it sits on the branch's base in its stack, retargeted there if it doesn't, and put in a GitHub stack with the PR below; a read that hits a passing GitHub outage is tried 3 times); the pre-PR gate (the profile's gate steps, detached and kept awake, slot-limited by slots every run on the machine shares, each slot with its own services; `--status` names the slot a gate waits for and who holds it). |
 | `pr_read.py <PR> comments\|reviews\|issue` | The chains' only way to read PR comments: GET only (chains may not call `gh api`). |
 | `runbook.md`, `settings.json`, `end_gate.py` | What every chain session is told and allowed; its stop hook. |
 | `status.py [queue]` | Every branch's state, phase, PR and last note. |
@@ -148,7 +149,7 @@ Machine fallbacks (doctor.py says when each applies):
 | `record_signoff.py` | Record a sign-off on design branches and queue their builds (`--dry-run` first). |
 | `approve.py` | Record the owner's review-item approvals (from each chain's tab) and queue the chains that apply them. |
 | `threads.py`, `answer.py` | List, reply to and resolve PR threads; answer summaries (the signature line added). |
-| `merge_base.sh <slug>` | Bring a branch up to date with the base after merges; `--commit` after resolving starts the gate. |
+| `merge_base.sh <slug>` | Bring a branch up to date with its own base (the branch below it in its stack, or the base) after merges, moving it down and retargeting its PR once the branch below merges (a retarget that fails changes nothing: INCOMPLETE, exit 4). In a GitHub stack, GitHub has moved and rebased it already: the local branch takes `origin/<branch>` (unpushed local commits: INCOMPLETE). `--commit` after resolving starts the gate. |
 | `retire.sh [--all-runs] [--apply]` | Remove worktrees and branches of merged PRs, keeping their state. After every merge batch; `--all-runs` covers earlier runs' late merges. |
 
 ## Changing the kit

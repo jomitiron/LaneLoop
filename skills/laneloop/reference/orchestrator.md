@@ -81,7 +81,9 @@ with `consult.py plan`, and carry its findings into the next draft. A run that s
      the feature's decisions log as a D-numbered entry; each term the owner settled goes into `docs/glossary.md`.
    - Recompute the frontier and publish the next round, until it is empty: nothing left silently assumed.
 5. **Draw up the plan** on the same page: branches by wave (wave 1 = no gate, wave 2 = mockup-gated, wave 3 =
-   schema-gated; a branch that depends on another waits for it), each with a `title`, its binding `scope` and its
+   schema-gated; a branch that depends on another waits for it). A branch that builds on another branch's code names it,
+   `"on": "<slug>"`: it is stacked on it, built on that branch and opening its PR against it. A branch with no `"on"` is
+   independent: it is built from the base and runs in parallel with everything else. Each has a `title`, its binding `scope` and its
    `tasks`: every outcome the branch delivers, each with the test that proves it (a design branch's tasks are what its
    page must show), and, for a build branch, `est_lines` under the PR cap ("Sizing Branches" below). A branch with no
    tasks is not planned yet.
@@ -231,9 +233,21 @@ the run for what isn't a ticket yet.
   worked around). Batch merge requests: one message listing every ready PR.
 - After every merge batch, first `retire.sh --apply`: each merged PR's worktree and branch go as it merges, not at the
   end of the run. A worktree is 5+ GB of builds; left to the close, they outlived their runs and filled the disk.
-- After merges, for every open PR:
+- A stack is merged from its PR page (or `PUT /repos/{owner}/{repo}/pulls/{n}/merge-async`): `gh pr merge` refuses a
+  PR in a GitHub stack.
+- After merges, for every open PR, **each stack bottom-up** (the branch below must be pushed before the one above it
+  merges it):
   1. `gh pr view <n> --json mergeable,mergeStateStatus` (UNKNOWN means GitHub is still computing: ask again).
-  2. `merge_base.sh <slug>`. Clean: check the shared files it prints for semantic clashes and build. Conflicts:
+  2. `merge_base.sh <slug>` merges the branch's own base (`.fixloop/base`: the branch below it, or the base at the
+     bottom). Once the branch below has merged, it moves the branch down onto what that one merged into and retargets
+     its PR (`gh pr edit --base`); if the retarget fails it prints INCOMPLETE with the reason, changes nothing and exits
+     4: fix that (usually gh auth) and run it again. In a GitHub stack, GitHub has already moved the PR down and rebased
+     (force-pushed) its branch: `merge_base.sh` then brings the local branch to `origin/<branch>`, writes the PR's live
+     base to `.fixloop/base`, merges and retargets nothing and exits 0. It tells "rebased" from "local work never
+     pushed" by every tip `origin/<branch>` has had here: the one before its fetch and the reflog's (which expires), so
+     a rebase is still seen with no reflog. Local commits never pushed stop it INCOMPLETE
+     (exit 4) rather than lose them, as does a stacked PR GitHub hasn't rebased yet (run it again later). Never
+     force-push a stacked branch. Clean: check the shared files it prints for semantic clashes and build. Conflicts:
      - Two sides added different members, rows or sections at the same spot: keep both; when the conflict sits mid-method,
        the shared closing lines must close each side's member.
      - One side moved code the other side changed (a call moved into a service, a release added on the old path): carry

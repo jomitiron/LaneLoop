@@ -60,7 +60,7 @@ the owner can answer; the summary is the exact ask), `blocked` (outside the task
 
 Allowed (see `kit/fix/settings.json.template`): read and edit the worktree, `task.py`, `gate.py`, the project's own
 build and test commands (the profile's `chain_allow`),
-local git (status, diff, log, add, commit, fetch, merge of the base), push to its own branch prefix, `gh pr create/view/checks/diff`,
+local git (status, diff, log, add, commit, fetch, merge of its base: the branch below it in its stack, or the base), push to its own branch prefix, `gh pr create/view/checks/diff`,
 `pr_read.py` (read-only PR comments and reviews), read-only shell tools.
 
 Denied: subagents, questions, artifacts, web, scheduling, worktree tools, force push, reset, rebase, checking out the base,
@@ -101,6 +101,15 @@ approval) and the owner merging. Never give a chain's account more rights than t
 - Several worktrees can build at once (each has its own build output); the slots keep heavy suites from starving each other.
 
 ## Briefs
+
+Every brief carries `Stacked on: <slug>` (or `-` for the bottom of a stack): the chain's worktree is built from that
+branch, its base is kept in `.fixloop/base`, and its PR targets it. `task.py pr` retargets a PR opened elsewhere and puts
+it in a GitHub stack with the PR below (a second child of one parent stays base-chained: stacks are linear). Stacking
+is extra: if GitHub refuses it, the PR is still recorded, base-chained, and the note says why. It refuses a PR it can't
+check is this branch's (another branch's, or no branch checked out), and never retargets one. If that
+branch has already merged, the chain is built from what it merged into. The runner starts the chain once that branch has
+opened its PR, or, for a design branch on a design branch, once that one has pushed its page (ended awaiting the owner).
+`task.py size` and `egm_plan.py boundary` measure a stacked branch against the branch below it.
 
 A good brief has: the binding scope in plain words (what to change, what not to touch, which decisions apply and how),
 the defects with their why (file:line) and fix, the investigation notes, the tests that re-verify it after merge, its

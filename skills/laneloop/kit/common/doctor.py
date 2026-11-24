@@ -125,7 +125,7 @@ def common():
         batt = run(["pmset", "-g", "batt"])[1]
         add("power", "unattended runs", "warn" if "Battery Power" in batt else "ok",
             "on battery: launch.sh refuses an unattended start until the Mac is plugged in; keep the lid open"
-            if "Battery Power" in batt else "on mains power; launch.sh runs the loop under caffeinate; keep the lid open",
+            if "Battery Power" in batt else "on mains power; the loop, its runner and every gate run under caffeinate; keep the lid open",
             fallback="plug the Mac in" if "Battery Power" in batt else "")
         add("macOS permissions", "notifications; raising the run's Chrome", "ok",
             "the first notification and the first raise_chrome.sh each ask once (System Settings: Notifications; Privacy & "
@@ -181,8 +181,9 @@ def launcher():
 
 
 def keep_awake():
-    """What keeps the computer awake under the loops (launch.sh) and the orchestrator's watchers (platform.sh)."""
-    need = "keeping the computer awake under loops and watchers"
+    """What keeps the computer awake under the loops (launch.sh), the runner, every gate and the orchestrator's watchers
+    (platform.sh, gate.py)."""
+    need = "keeping the computer awake under loops, runners, gates and watchers"
     lid = "keep a laptop's lid open: a closed lid still sleeps it"
     if MAC and "Battery Power" in run(["pmset", "-g", "batt"])[1]:
         add("keep awake", need, "warn", "on battery: launch.sh refuses to start a loop, and a sleep stalls the run",
